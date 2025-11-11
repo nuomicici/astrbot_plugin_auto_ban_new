@@ -181,10 +181,10 @@ class AutoBanNewMemberPlugin(Star):
         # 构建禁言时长列表，提供默认值防止配置缺失
         ban_durations_config = self.config.get("ban_durations", {})
         self.ban_durations = [
-            ban_durations_config.get("first_ban") or 180,
-            ban_durations_config.get("second_ban") or 180, 
-            ban_durations_config.get("third_ban") or 600,
-            ban_durations_config.get("fourth_and_more_ban") or 3600
+            ban_durations_config.get("first_ban", 180),
+            ban_durations_config.get("second_ban", 180), 
+            ban_durations_config.get("third_ban", 600),
+            ban_durations_config.get("fourth_and_more_ban", 3600)
         ]
         
         # 读取消息配置，提供默认值
