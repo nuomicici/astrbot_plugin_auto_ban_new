@@ -362,14 +362,10 @@ class AutoBanNewMemberPlugin(Star):
             return has_valid_content
         except Exception as e:
             logger.error(f"判断消息有效性时出错: {e}")
-            return False
+            return True
 
     def remove_user_from_watchlist(self, user_identifier: tuple, reason: str) -> bool:
         """从监听列表中移除用户"""
-        # 如果未启用后续监测，则无需移除操作，但仍视为成功处理以保持上层逻辑一致
-        if not self.enable_follow_up_monitoring:
-            return True
-
         group_id, user_id = user_identifier
         if user_identifier in self.banned_users:
             del self.banned_users[user_identifier]
@@ -565,11 +561,7 @@ class AutoBanNewMemberPlugin(Star):
             # 包含白名单关键词则移除监听
             if has_whitelist_keyword:
                 removed = self.remove_user_from_watchlist(user_identifier, "关键词")
-                if (
-                    removed
-                    and self.whitelist_success_message
-                    and self.whitelist_success_message.strip()
-                ):
+                if removed and self.whitelist_success_message.strip():
                     yield event.plain_result(self.whitelist_success_message)
                 return
 
