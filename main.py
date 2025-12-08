@@ -251,6 +251,9 @@ class AutoBanNewMemberPlugin(Star):
         self.data_dir = StarTools.get_data_dir()
         self.data_file = self.data_dir / "banned_users.json"
 
+        # 后台任务状态标记，防止重复启动定时任务
+        self._periodic_task_started = False
+
     async def initialize(self):
         """插件初始化"""
         try:
@@ -259,6 +262,7 @@ class AutoBanNewMemberPlugin(Star):
             # 只有启用后续监测时才启动定期检查任务
             if self.enable_follow_up_monitoring:
                 asyncio.create_task(self.periodic_member_check())
+                self._periodic_task_started = True
                 logger.info(
                     "自动禁言新成员插件已初始化，后续发言监测功能已启用，成功加载历史数据并启动后台检查任务"
                 )
@@ -746,7 +750,7 @@ class AutoBanNewMemberPlugin(Star):
         self.config.save_config()
 
         # 启动后台检查任务（如果尚未启动）
-        if not hasattr(self, "_periodic_task_started"):
+        if not self._periodic_task_started:
             asyncio.create_task(self.periodic_member_check())
             self._periodic_task_started = True
 
