@@ -125,6 +125,7 @@ git clone https://github.com/nuomicici/astrbot_plugin_auto_ban_new
 | 配置项 | 类型 | 说明 | 默认值 |
 |--------|------|------|--------|
 | `whitelist_keywords` | 列表 | 解除监听关键词 | `["我已阅读并同意遵守群规"]` |
+| `whitelist_success_message` | 文本 | 关键字解除成功后发送的纯文本提示，留空则不提示 | `"检测到您已阅读群规，已取消监控，欢迎正常发言~"` |
 | `enable_poke_whitelist` | 布尔 | 启用戳一戳解除监听 | `false` |
 | `poke_whitelist_message` | 文本 | 戳一戳解除监听提示 | 默认提示词 |
 
