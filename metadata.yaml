@@ -1,5 +1,5 @@
 name: "进群禁言"
 desc: "在指定群聊中对新入群用户自动禁言并发送欢迎消息，支持多种方式解除监听。帮助群管理员更好地管理新成员，确保新成员先阅读群规再发言。"
-version: "v1.4"
+version: "v1.5"
 author: "糯米茨"
 repo: https://github.com/nuomicici/astrbot_plugin_auto_ban_new
