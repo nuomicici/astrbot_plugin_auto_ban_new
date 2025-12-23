@@ -218,7 +218,8 @@ A: 配置修改后会立即生效，如果仍有问题：
 ---
 **贡献者**：
 - [nuomicici](https://github.com/nuomicici/)
-- [氕氙](https://github.com/piexian)
+- [氕氙](https://github.com/piexian)  
+
 **作者**: 糯米茨  
 **联系方式**: 
 - [GitHub Issues](https://github.com/nuomicici/astrbot_plugin_auto_ban_new/issues)  
