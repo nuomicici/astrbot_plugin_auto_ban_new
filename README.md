@@ -2,7 +2,7 @@
 <img style="width:70%" src="https://count.getloli.com/@astrbot_plugin_auto_ban_new?name=astrbot_plugin_auto_ban_new&theme=gelbooru-h&padding=5&offset=0&align=top&scale=1&pixelated=1&darkmode=auto" alt=":name">
 </div>
 
-# AstrBot 自动禁言新成员插件 v 1.4
+# AstrBot 自动禁言新成员插件 v 1.5
 又名“进群禁言”  
 简体中文 | [EN](https://github.com/nuomicici/astrbot_plugin_auto_ban_new/blob/main/README_en.md) | [日本語](https://github.com/nuomicici/astrbot_plugin_auto_ban_new/blob/main/README_JP.md)
 
@@ -19,7 +19,9 @@
 在指定群聊中对新入群用户自动禁言并发送欢迎消息，支持多种方式解除监听。帮助群管理员更好地管理新成员，确保新成员先阅读群规再发言。
 
 ## 📄 更新日志
-### v1.4（当前版本）
+### v1.5
+- 合并了大佬的pr，忘记啥功能了（
+### v1.4
 - ⚒️ 修复了由于我菜然后出现的权限组漏洞
 ### v1.3
 - ☠️ 哈哈哈！添加了命令功能！
