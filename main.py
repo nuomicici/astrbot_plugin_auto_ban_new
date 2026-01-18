@@ -2,6 +2,7 @@ import asyncio
 import json
 from collections.abc import AsyncGenerator
 from functools import wraps
+from pathlib import Path
 from typing import Optional
 
 import astrbot.api.message_components as Comp
@@ -176,7 +177,7 @@ high_priority_event = _high_priority(filter.event_message_type)
 class AutoBanNewMemberPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
-        self.config = config
+        self.config = config or {}
 
         # 初始化权限管理器
         self.admins_id = context.get_config().get("admins_id", [])
@@ -250,7 +251,7 @@ class AutoBanNewMemberPlugin(Star):
 
         # 使用框架标准方式获取数据目录
         self.data_dir = (
-            get_astrbot_data_path() / "plugin_data" / "astrbot_plugin_auto_ban_new"
+            Path(get_astrbot_data_path()) / "plugin_data" / "astrbot_plugin_auto_ban_new"
         )
         self.data_file = self.data_dir / "banned_users.json"
 
