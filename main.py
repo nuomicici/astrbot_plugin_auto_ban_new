@@ -794,7 +794,7 @@ class AutoBanNewMemberPlugin(Star):
         yield event.plain_result("已开启后续发言监测功能，新成员入群后将被持续监听")
 
     @auto_ban_commands.command("名单")
-    @perm_required(PermLevel.SUPERUSER)
+    @filter.permission_type(filter.PermissionType.ADMIN)
     async def show_ban_list(
         self, event: AiocqhttpMessageEvent
     ) -> AsyncGenerator[MessageEventResult, None]:
