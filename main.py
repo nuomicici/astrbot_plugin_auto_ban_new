@@ -301,7 +301,8 @@ class AutoBanNewMemberPlugin(Star):
     def _migrate_old_data(self):
         """检查并迁移旧数据目录的数据文件"""
         try:
-            # 尝试从 StarTools 获取旧的数据目录
+            import shutil
+
             from astrbot.core.star.star_tools import StarTools
 
             old_data_dir = StarTools.get_data_dir("astrbot_plugin_auto_ban_new")
@@ -309,12 +310,7 @@ class AutoBanNewMemberPlugin(Star):
 
             # 如果旧数据文件存在且新数据文件不存在，则迁移数据
             if old_data_file.exists() and not self.data_file.exists():
-                # 确保新数据目录存在
                 self.data_dir.mkdir(parents=True, exist_ok=True)
-
-                # 复制数据文件
-                import shutil
-
                 shutil.copy2(old_data_file, self.data_file)
                 logger.info(f"已将旧数据文件从 {old_data_file} 迁移到 {self.data_file}")
         except ImportError:
@@ -673,12 +669,14 @@ class AutoBanNewMemberPlugin(Star):
         while True:
             try:
                 # 获取 aiocqhttp 平台实例
-                client = None
-                for platform in self.context.platform_manager.get_insts():
-                    if platform.meta().name == "aiocqhttp":
-                        client = platform.get_client()
-                        if client:
-                            break
+                client = next(
+                    (
+                        c
+                        for p in self.context.platform_manager.get_insts()
+                        if p.meta().name == "aiocqhttp" and (c := p.get_client())
+                    ),
+                    None,
+                )
 
                 if not client:
                     logger.warning(
