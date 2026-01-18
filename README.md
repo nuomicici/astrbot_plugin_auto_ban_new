@@ -10,7 +10,7 @@
 
 - **插件名称**: astrbot_plugin_auto_ban_new
 - **作者**: 糯米茨
-- **版本**: v1.4
+- **版本**: v1.5
 - **仓库地址**: [GitHub](https://github.com/nuomicici/astrbot_plugin_auto_ban_new)
 - **标签**: 群管、禁言
 

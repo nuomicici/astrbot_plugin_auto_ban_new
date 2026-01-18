@@ -172,7 +172,7 @@ high_priority_event = _high_priority(filter.event_message_type)
     "astrbot_plugin_auto_ban_new",
     "糯米茨",
     "在指定群聊中对新入群用户自动禁言并发送欢迎消息，支持多种方式解除监听。",
-    "v1.4",
+    "v1.5",
 )
 class AutoBanNewMemberPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
@@ -251,7 +251,9 @@ class AutoBanNewMemberPlugin(Star):
 
         # 使用框架标准方式获取数据目录
         self.data_dir = (
-            Path(get_astrbot_data_path()) / "plugin_data" / "astrbot_plugin_auto_ban_new"
+            Path(get_astrbot_data_path())
+            / "plugin_data"
+            / "astrbot_plugin_auto_ban_new"
         )
         self.data_file = self.data_dir / "banned_users.json"
 
@@ -791,6 +793,48 @@ class AutoBanNewMemberPlugin(Star):
 
         yield event.plain_result("已开启后续发言监测功能，新成员入群后将被持续监听")
 
+    @auto_ban_commands.command("名单")
+    @perm_required(PermLevel.SUPERUSER)
+    async def show_ban_list(
+        self, event: AiocqhttpMessageEvent
+    ) -> AsyncGenerator[MessageEventResult, None]:
+        """查看当前被监听的用户名单（仅超级管理员）"""
+        if not self.banned_users:
+            yield event.plain_result("当前没有被监听的用户")
+            return
+
+        # 构建表格
+        lines = ["===当前禁言监听名单===", "群号        | 昵称           | QQ号"]
+        lines.append("-" * 45)
+
+        for (group_id, user_id), ban_count in self.banned_users.items():
+            # 尝试获取用户昵称
+            nickname = str(user_id)
+            try:
+                member_info = await event.bot.get_group_member_info(
+                    group_id=int(group_id), user_id=int(user_id), no_cache=False
+                )
+                nickname = (
+                    member_info.get("nickname")
+                    or member_info.get("card")
+                    or str(user_id)
+                )
+                # 截断过长的昵称
+                if len(nickname) > 10:
+                    nickname = nickname[:9] + "…"
+            except Exception:
+                nickname = "(未知)"
+
+            # 格式化输出行
+            lines.append(
+                f"{group_id:<11} | {nickname:<14} | {user_id} (禁言{ban_count}次)"
+            )
+
+        lines.append("-" * 45)
+        lines.append(f"共 {len(self.banned_users)} 人")
+
+        yield event.plain_result("\n".join(lines))
+
     @filter.command("设置解禁关键词")
     @perm_required(PermLevel.ADMIN)
     async def set_whitelist_keywords(
@@ -1004,7 +1048,7 @@ class AutoBanNewMemberPlugin(Star):
     ) -> AsyncGenerator[MessageEventResult, None]:
         """显示插件帮助信息"""
         help_text = """===AstrBot 自动禁言插件===
-v1.4 by 糯米茨(3218444911)
+v1.5 by 糯米茨(3218444911)
 插件简介：
 在指定群聊中对新入群用户自动禁言并发送欢迎消息，支持多种方式解除监听。帮助群管理员更好地管理新成员，确保新成员先阅读群规再发言。
 可用命令（仅群管理员&BOT管理员）：
@@ -1024,6 +1068,7 @@ v1.4 by 糯米茨(3218444911)
 
 🛠️ 超级管理员专用
 - /添加启用群聊 <群号> - 添加启用群聊
+- /自动禁言 名单 - 查看当前被监听的用户名单
 
 示例用法：
 - /设置解禁关键词 我已阅读群规 同意遵守
