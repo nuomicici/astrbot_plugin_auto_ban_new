@@ -2,16 +2,18 @@ import asyncio
 import json
 from collections.abc import AsyncGenerator
 from functools import wraps
+from pathlib import Path
 from typing import Optional
 
 import astrbot.api.message_components as Comp
 from astrbot.api import logger
 from astrbot.api.event import MessageEventResult, filter
-from astrbot.api.star import Context, Star, StarTools, register
+from astrbot.api.star import Context, Star, register
 from astrbot.core import AstrBotConfig
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
     AiocqhttpMessageEvent,
 )
+from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 
 # 权限组内容参考https://github.com/Zhalslar/astrbot_plugin_QQAdmin
@@ -170,12 +172,12 @@ high_priority_event = _high_priority(filter.event_message_type)
     "astrbot_plugin_auto_ban_new",
     "糯米茨",
     "在指定群聊中对新入群用户自动禁言并发送欢迎消息，支持多种方式解除监听。",
-    "v1.4",
+    "v1.5",
 )
 class AutoBanNewMemberPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
-        self.config = config
+        self.config = config or {}
 
         # 初始化权限管理器
         self.admins_id = context.get_config().get("admins_id", [])
@@ -248,8 +250,15 @@ class AutoBanNewMemberPlugin(Star):
         self.banned_users = {}
 
         # 使用框架标准方式获取数据目录
-        self.data_dir = StarTools.get_data_dir()
+        self.data_dir = (
+            Path(get_astrbot_data_path())
+            / "plugin_data"
+            / "astrbot_plugin_auto_ban_new"
+        )
         self.data_file = self.data_dir / "banned_users.json"
+
+        # 检查并迁移旧数据目录的数据（如果存在）
+        self._migrate_old_data()
 
         # 后台任务状态标记，防止重复启动定时任务
         self._periodic_task_started = False
@@ -291,6 +300,27 @@ class AutoBanNewMemberPlugin(Star):
             logger.error(f"终止插件时文件系统错误: {e}")
         except Exception as e:
             logger.error(f"终止插件时出现未预期的错误: {e}")
+
+    def _migrate_old_data(self):
+        """检查并迁移旧数据目录的数据文件"""
+        try:
+            import shutil
+
+            from astrbot.core.star.star_tools import StarTools
+
+            old_data_dir = StarTools.get_data_dir("astrbot_plugin_auto_ban_new")
+            old_data_file = old_data_dir / "banned_users.json"
+
+            # 如果旧数据文件存在且新数据文件不存在，则迁移数据
+            if old_data_file.exists() and not self.data_file.exists():
+                self.data_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(old_data_file, self.data_file)
+                logger.info(f"已将旧数据文件从 {old_data_file} 迁移到 {self.data_file}")
+        except ImportError:
+            # StarTools 不存在，跳过迁移
+            logger.debug("StarTools 不可用，跳过旧数据迁移")
+        except Exception as e:
+            logger.warning(f"迁移旧数据时出错: {e}")
 
     def _load_banned_users(self):
         """从文件加载被禁言用户数据"""
@@ -641,15 +671,22 @@ class AutoBanNewMemberPlugin(Star):
         await asyncio.sleep(60)  # 启动后稍作等待，避免与其他启动任务冲突
         while True:
             try:
-                platform = self.context.get_platform("aiocqhttp")
-                if not platform or not hasattr(platform, "client"):
+                # 获取 aiocqhttp 平台实例
+                client = next(
+                    (
+                        c
+                        for p in self.context.platform_manager.get_insts()
+                        if p.meta().name == "aiocqhttp" and (c := p.get_client())
+                    ),
+                    None,
+                )
+
+                if not client:
                     logger.warning(
                         "未能获取到 aiocqhttp 平台实例，成员检查将在1小时后重试。"
                     )
                     await asyncio.sleep(3600)
                     continue
-
-                client = platform.client
                 # 按群组ID对被监听用户进行分组，以减少API调用次数
                 groups_to_check = {}
                 # 创建banned_users的副本进行迭代，防止在迭代过程中修改字典
@@ -666,7 +703,7 @@ class AutoBanNewMemberPlugin(Star):
                 for group_id, users_in_group_to_check in groups_to_check.items():
                     try:
                         # 获取群成员列表
-                        members_info = await client.api.call_action(
+                        members_info = await client.call_action(
                             "get_group_member_list",
                             group_id=int(group_id),
                             no_cache=True,
@@ -755,6 +792,48 @@ class AutoBanNewMemberPlugin(Star):
             self._periodic_task_started = True
 
         yield event.plain_result("已开启后续发言监测功能，新成员入群后将被持续监听")
+
+    @auto_ban_commands.command("名单")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def show_ban_list(
+        self, event: AiocqhttpMessageEvent
+    ) -> AsyncGenerator[MessageEventResult, None]:
+        """查看当前被监听的用户名单（仅超级管理员）"""
+        if not self.banned_users:
+            yield event.plain_result("当前没有被监听的用户")
+            return
+
+        # 构建表格
+        lines = ["===当前禁言监听名单===", "群号        | 昵称           | QQ号"]
+        lines.append("-" * 45)
+
+        for (group_id, user_id), ban_count in self.banned_users.items():
+            # 尝试获取用户昵称
+            nickname = str(user_id)
+            try:
+                member_info = await event.bot.get_group_member_info(
+                    group_id=int(group_id), user_id=int(user_id), no_cache=False
+                )
+                nickname = (
+                    member_info.get("nickname")
+                    or member_info.get("card")
+                    or str(user_id)
+                )
+                # 截断过长的昵称
+                if len(nickname) > 10:
+                    nickname = nickname[:9] + "…"
+            except Exception:
+                nickname = "(未知)"
+
+            # 格式化输出行
+            lines.append(
+                f"{group_id:<11} | {nickname:<14} | {user_id} (禁言{ban_count}次)"
+            )
+
+        lines.append("-" * 45)
+        lines.append(f"共 {len(self.banned_users)} 人")
+
+        yield event.plain_result("\n".join(lines))
 
     @filter.command("设置解禁关键词")
     @perm_required(PermLevel.ADMIN)
@@ -969,7 +1048,7 @@ class AutoBanNewMemberPlugin(Star):
     ) -> AsyncGenerator[MessageEventResult, None]:
         """显示插件帮助信息"""
         help_text = """===AstrBot 自动禁言插件===
-v1.4 by 糯米茨(3218444911)
+v1.5 by 糯米茨(3218444911)
 插件简介：
 在指定群聊中对新入群用户自动禁言并发送欢迎消息，支持多种方式解除监听。帮助群管理员更好地管理新成员，确保新成员先阅读群规再发言。
 可用命令（仅群管理员&BOT管理员）：
@@ -989,6 +1068,7 @@ v1.4 by 糯米茨(3218444911)
 
 🛠️ 超级管理员专用
 - /添加启用群聊 <群号> - 添加启用群聊
+- /自动禁言 名单 - 查看当前被监听的用户名单
 
 示例用法：
 - /设置解禁关键词 我已阅读群规 同意遵守
