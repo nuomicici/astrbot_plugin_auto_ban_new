@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from collections.abc import AsyncGenerator
 from functools import wraps
 from pathlib import Path
@@ -398,6 +399,32 @@ class AutoBanNewMemberPlugin(Star):
             logger.error(f"判断消息有效性时出错: {e}")
             return True
 
+    async def get_mute_remaining_seconds(
+        self, event: AiocqhttpMessageEvent, group_id: str, user_id: int
+    ) -> int | None:
+        """获取群成员当前剩余禁言时间，查询失败时返回 None。"""
+        try:
+            member_info = await event.bot.get_group_member_info(
+                group_id=int(group_id), user_id=int(user_id), no_cache=True
+            )
+        except Exception as e:
+            logger.warning(
+                f"查询用户 {user_id} 在群 {group_id} 的禁言状态失败，将继续按本插件规则处理: {e}"
+            )
+            return None
+
+        try:
+            shut_up_timestamp = int(member_info.get("shut_up_timestamp") or 0)
+        except (TypeError, ValueError):
+            logger.warning(
+                f"用户 {user_id} 在群 {group_id} 的禁言状态字段异常: {member_info.get('shut_up_timestamp')!r}"
+            )
+            return None
+
+        if shut_up_timestamp <= 0:
+            return 0
+        return max(0, shut_up_timestamp - int(time.time()))
+
     def remove_user_from_watchlist(self, user_identifier: tuple, reason: str) -> bool:
         """从监听列表中移除用户"""
         group_id, user_id = user_identifier
@@ -597,6 +624,7 @@ class AutoBanNewMemberPlugin(Star):
                 removed = self.remove_user_from_watchlist(user_identifier, "关键词")
                 if removed and self.whitelist_success_message.strip():
                     yield event.plain_result(self.whitelist_success_message)
+                event.stop_event()
                 return
 
             # 无效消息不触发禁言
@@ -607,6 +635,26 @@ class AutoBanNewMemberPlugin(Star):
             # 有效消息且无白名单关键词则触发禁言或踢出
             try:
                 current_total_count = self.banned_users[user_identifier]
+                duration_index = min(current_total_count, len(self.ban_durations) - 1)
+                current_ban_duration = self.ban_durations[duration_index]
+                mute_remaining = await self.get_mute_remaining_seconds(
+                    event, group_id, user_id
+                )
+
+                if mute_remaining is not None and mute_remaining > current_ban_duration:
+                    logger.info(
+                        f"跳过用户 {user_id} 在群 {group_id} 的后续禁言：当前剩余禁言 {mute_remaining} 秒，"
+                        f"超过本插件本次计划禁言 {current_ban_duration} 秒，可能已被其他禁言插件或群管操作占用。"
+                    )
+                    event.stop_event()
+                    return
+
+                if mute_remaining is not None and mute_remaining > 0:
+                    logger.info(
+                        f"用户 {user_id} 在群 {group_id} 当前仍处于禁言中，剩余 {mute_remaining} 秒未超过"
+                        f"本插件本次计划禁言 {current_ban_duration} 秒，将刷新覆盖。"
+                    )
+
                 new_total_count = current_total_count + 1
 
                 # 检查是否达到踢出阈值
@@ -628,12 +676,10 @@ class AutoBanNewMemberPlugin(Star):
 
                     # 从监听列表移除用户
                     self.remove_user_from_watchlist(user_identifier, "达到踢出阈值")
+                    event.stop_event()
                     return  # 结束处理
 
                 # 如果未达到踢出阈值，则执行禁言
-                duration_index = min(current_total_count, len(self.ban_durations) - 1)
-                current_ban_duration = self.ban_durations[duration_index]
-
                 await event.bot.set_group_ban(
                     group_id=int(group_id),
                     user_id=user_id,
@@ -656,6 +702,7 @@ class AutoBanNewMemberPlugin(Star):
                     Comp.Plain(text=reminder_message),
                 ]
                 yield event.chain_result(response_chain)
+                event.stop_event()
 
             except Exception as e:
                 logger.error(f"处理被禁言用户消息时执行禁言或踢出操作出错: {e}")
