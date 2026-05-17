@@ -11,6 +11,12 @@
     "hint": "开启后会监测新成员入群后的发言情况并进行后续禁言处理；关闭后仅对新成员进行入群禁言，不再进行后续监测",
     "default": false
   },
+  "enable_recall_noncompliant_messages": {
+    "description": "撤回未按要求的发言",
+    "type": "bool",
+    "hint": "开启后，被监听用户发送不含解除关键词的有效发言时，插件会尝试先撤回该消息，再执行后续禁言或踢出处理；需要机器人有撤回权限",
+    "default": false
+  },
   "ban_durations": {
     "description": "自动禁言时长设置（秒）",
     "type": "object",

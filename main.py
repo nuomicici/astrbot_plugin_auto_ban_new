@@ -169,6 +169,16 @@ def _high_priority(deco):
 high_priority_event = _high_priority(filter.event_message_type)
 
 
+def parse_switch_value(value: str) -> bool | None:
+    """解析 on/off 类命令参数。"""
+    normalized = value.strip().lower()
+    if normalized in {"on", "true", "1", "yes", "y", "开启", "启用", "开"}:
+        return True
+    if normalized in {"off", "false", "0", "no", "n", "关闭", "禁用", "关"}:
+        return False
+    return None
+
+
 @register(
     "astrbot_plugin_auto_ban_new",
     "糯米茨",
@@ -197,6 +207,9 @@ class AutoBanNewMemberPlugin(Star):
         # 新增：是否启用后续发言监测功能（默认关闭）
         self.enable_follow_up_monitoring = self.config.get(
             "enable_follow_up_monitoring", False
+        )
+        self.enable_recall_noncompliant_messages = self.config.get(
+            "enable_recall_noncompliant_messages", False
         )
 
         # 构建禁言时长列表，提供默认值防止配置缺失
@@ -384,20 +397,54 @@ class AutoBanNewMemberPlugin(Star):
         """判断消息是否为有效消息，排除戳一戳等特殊消息"""
         try:
             message_components = event.get_messages()
-            if not message_components:
-                return False
             message_outline = event.get_message_outline()
             if "[poke]" in message_outline:
                 return False
-            # 检查是否包含有效内容
-            has_valid_content = any(
-                isinstance(seg, (Comp.Plain, Comp.At, Comp.Image, Comp.Video))
-                for seg in message_components
+            if message_components:
+                return any(not isinstance(seg, Comp.Poke) for seg in message_components)
+
+            raw_message = getattr(event.message_obj, "raw_message", None)
+            raw_segments = (
+                raw_message.get("message") if isinstance(raw_message, dict) else None
             )
-            return has_valid_content
+            if isinstance(raw_segments, list):
+                return any(
+                    seg.get("type") != "poke"
+                    for seg in raw_segments
+                    if isinstance(seg, dict)
+                )
+            return False
         except Exception as e:
             logger.error(f"判断消息有效性时出错: {e}")
             return True
+
+    async def recall_noncompliant_message(
+        self, event: AiocqhttpMessageEvent, group_id: str, user_id: int
+    ) -> None:
+        """按配置撤回被监听用户未按要求发送的消息。"""
+        if not self.enable_recall_noncompliant_messages:
+            return
+
+        message_id = getattr(event.message_obj, "message_id", None)
+        if message_id in (None, ""):
+            logger.warning(
+                f"用户 {user_id} 在群 {group_id} 的违规发言缺少 message_id，无法撤回。"
+            )
+            return
+
+        try:
+            await event.bot.delete_msg(message_id=int(message_id))
+            logger.info(
+                f"已撤回用户 {user_id} 在群 {group_id} 中未按要求发送的消息 {message_id}。"
+            )
+        except (TypeError, ValueError):
+            logger.warning(
+                f"用户 {user_id} 在群 {group_id} 的违规发言 message_id 非数字，无法撤回: {message_id!r}"
+            )
+        except Exception as e:
+            logger.warning(
+                f"撤回用户 {user_id} 在群 {group_id} 中未按要求发送的消息 {message_id} 失败: {e}"
+            )
 
     async def get_mute_remaining_seconds(
         self, event: AiocqhttpMessageEvent, group_id: str, user_id: int
@@ -623,7 +670,7 @@ class AutoBanNewMemberPlugin(Star):
             if has_whitelist_keyword:
                 removed = self.remove_user_from_watchlist(user_identifier, "关键词")
                 if removed and self.whitelist_success_message.strip():
-                    yield event.plain_result(self.whitelist_success_message)
+                    await event.send(event.plain_result(self.whitelist_success_message))
                 event.stop_event()
                 return
 
@@ -631,6 +678,8 @@ class AutoBanNewMemberPlugin(Star):
             if not self.is_valid_message(event):
                 logger.debug(f"用户{user_id}发送了无效消息，不触发禁言")
                 return
+
+            await self.recall_noncompliant_message(event, group_id, user_id)
 
             # 有效消息且无白名单关键词则触发禁言或踢出
             try:
@@ -663,7 +712,7 @@ class AutoBanNewMemberPlugin(Star):
                         Comp.At(qq=user_id),
                         Comp.Plain(text=self.kick_message),
                     ]
-                    yield event.chain_result(kick_message_chain)
+                    await event.send(event.chain_result(kick_message_chain))
 
                     await event.bot.set_group_kick(
                         group_id=int(group_id),
@@ -701,7 +750,7 @@ class AutoBanNewMemberPlugin(Star):
                     Comp.At(qq=user_id),
                     Comp.Plain(text=reminder_message),
                 ]
-                yield event.chain_result(response_chain)
+                await event.send(event.chain_result(response_chain))
                 event.stop_event()
 
             except Exception as e:
@@ -839,6 +888,24 @@ class AutoBanNewMemberPlugin(Star):
             self._periodic_task_started = True
 
         yield event.plain_result("已开启后续发言监测功能，新成员入群后将被持续监听")
+
+    @auto_ban_commands.command("撤回")
+    @perm_required(PermLevel.ADMIN)
+    async def set_recall_noncompliant_messages(
+        self, event: AiocqhttpMessageEvent, switch: str
+    ) -> AsyncGenerator[MessageEventResult, None]:
+        """设置是否撤回被监听用户未按要求发送的消息"""
+        enabled = parse_switch_value(switch)
+        if enabled is None:
+            yield event.plain_result("参数应为 on/off、开启/关闭 或 true/false")
+            return
+
+        self.enable_recall_noncompliant_messages = enabled
+        self.config["enable_recall_noncompliant_messages"] = enabled
+        self.config.save_config()
+
+        status = "开启" if enabled else "关闭"
+        yield event.plain_result(f"已{status}未按要求发言自动撤回功能")
 
     @auto_ban_commands.command("名单")
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -1101,6 +1168,7 @@ v1.5 by 糯米茨(3218444911)
 可用命令（仅群管理员&BOT管理员）：
 ⚙️ 功能设置
 - /自动禁言 off/on - 关闭/开启后续禁言监测
+- /自动禁言 撤回 on/off - 设置是否撤回未按要求的发言
 - /设置解禁关键词 <关键词> - 设置解除监听关键词
 - /设置禁言踢出次数 <次数> - 设置踢出阈值
 - /设置禁言时长 <配置> - 设置各次禁言时长
@@ -1121,6 +1189,7 @@ v1.5 by 糯米茨(3218444911)
 - /设置解禁关键词 我已阅读群规 同意遵守
 - /设置禁言踢出次数 5
 - /设置禁言时长 1/60 2/300 3/1800 4/7200
+- /自动禁言 撤回 on
 - /添加启用群聊 123456789
 - /设置入群提醒 欢迎新成员！请先阅读群规
 - /设置禁言提示消息 2/请仔细阅读群规后再发言
