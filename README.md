@@ -1,3 +1,7 @@
+<div align="center">
+<img style="width:70%" src="https://count.getloli.com/@astrbot_plugin_auto_ban_new?name=astrbot_plugin_auto_ban_new&theme=gelbooru-h&padding=5&offset=0&align=top&scale=1&pixelated=1&darkmode=auto" alt=":name">
+</div>
+
 # AstrBot 进群禁言插件
 
 一个功能完善的 QQ 群新成员管理插件，通过自动禁言和递进式监控机制，引导新成员先阅读群规再发言，有效防止入群刷屏、打广告等行为。
