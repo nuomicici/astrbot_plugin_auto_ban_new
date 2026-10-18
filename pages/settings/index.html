@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>进群禁言管理</title>
+    <link rel="stylesheet" href="./styles.css">
+    <script src="/api/plugin/page/bridge-sdk.js"></script>
+</head>
+<body>
+    <div class="app-container" id="app">
+        <header class="app-header">
+            <h1 class="app-title">进群禁言管理控制台</h1>
+            <div class="header-actions">
+                <button class="btn-secondary" id="btn-theme" type="button" title="切换显示主题">切换主题</button>
+                <button class="btn-primary" id="btn-refresh" type="button">刷新群列表</button>
+            </div>
+        </header>
+
+        <div class="workspace">
+            <!-- 左侧：群列表面板 -->
+            <aside class="group-list-panel">
+                <div class="panel-header">
+                    <h2>可管理群聊 (管理/群主)</h2>
+                    <span class="group-count" id="group-count">0</span>
+                </div>
+                <div class="group-list" id="group-list">
+                    <div class="loading-state">正在加载群聊列表...</div>
+                </div>
+            </aside>
+
+            <!-- 右侧：配置与监控面板 -->
+            <main class="config-panel">
+                <div class="empty-state" id="empty-state">
+                    <div class="empty-icon">请在左侧选择一个群聊开始管理</div>
+                </div>
+
+                <div class="config-content" id="config-content" style="display: none;">
+                    <!-- 群基本信息卡片 -->
+                    <section class="group-info">
+                        <img class="group-avatar" id="group-avatar" src="" alt="群头像">
+                        <div class="group-details">
+                            <h2 class="group-name" id="group-name">群名称</h2>
+                            <div class="group-meta">
+                                <span class="meta-item">群号: <strong id="group-id-display"></strong></span>
+                                <span class="meta-item">Bot 身份: <span id="bot-role-container"></span></span>
+                            </div>
+                        </div>
+                    </section>
+
+                    <!-- 配置编辑表单 -->
+                    <form class="config-form" id="config-form">
+                        <!-- 基础管控开关 -->
+                        <section class="form-section">
+                            <h3 class="section-title">基础管控开关与设置</h3>
+
+                            <!-- 1. 群总功能开关 -->
+                            <div class="form-field">
+                                <label class="field-label" for="enabled">
+                                    <span>群总功能开关</span>
+                                    <input type="checkbox" class="switch" id="enabled" name="enabled">
+                                </label>
+                                <p class="field-hint">本群进群禁言总开关。关闭后，本插件对该群完全静默，不进行任何干预（默认关闭）</p>
+                            </div>
+
+                            <!-- 2. 首次禁言开关与时长 -->
+                            <div class="form-field">
+                                <label class="field-label" for="enable_initial_ban">
+                                    <span>首次入群禁言开关</span>
+                                    <input type="checkbox" class="switch" id="enable_initial_ban" name="enable_initial_ban">
+                                </label>
+                                <p class="field-hint">开启后，新成员入群时立即执行初始禁言；关闭后入群不禁言，但可正常出题与引导验证</p>
+                            </div>
+
+                            <div class="form-field">
+                                <label class="field-label" for="initial_ban_duration">首次入群禁言时长（秒）</label>
+                                <input type="number" class="field-input" id="initial_ban_duration"
+                                       name="initial_ban_duration" min="0" max="2592000" value="180">
+                                <p class="field-hint">新成员入群时的初始临时禁言时长，默认 180 秒（3 分钟）</p>
+                            </div>
+
+                            <!-- 3. 后续监听开关 -->
+                            <div class="form-field">
+                                <label class="field-label" for="enable_follow_up_monitoring">
+                                    <span>后续发言监听开关</span>
+                                    <input type="checkbox" class="switch" id="enable_follow_up_monitoring"
+                                           name="enable_follow_up_monitoring">
+                                </label>
+                                <p class="field-hint">开启后，将对新成员发言持续拦截与验证，直到答对题目或满足解禁条件（默认关闭）</p>
+                            </div>
+
+                            <!-- 4. 后续禁言开关 -->
+                            <div class="form-field">
+                                <label class="field-label" for="enable_follow_up_ban">
+                                    <span>后续违规禁言开关</span>
+                                    <input type="checkbox" class="switch" id="enable_follow_up_ban"
+                                           name="enable_follow_up_ban">
+                                </label>
+                                <p class="field-hint">开启后，监听中成员未按要求发言将被执行递进阶梯禁言；关闭后违规不执行禁言操作</p>
+                            </div>
+
+                            <!-- 5. 撤回开关 -->
+                            <div class="form-field">
+                                <label class="field-label" for="enable_recall_noncompliant_messages">
+                                    <span>自动撤回违规发言开关</span>
+                                    <input type="checkbox" class="switch" id="enable_recall_noncompliant_messages"
+                                           name="enable_recall_noncompliant_messages">
+                                </label>
+                                <p class="field-hint">开启后，仅当用户处于监听中状态且未按要求作答时，机器人自动撤回该消息；正常群员及解禁用户消息绝不撤回</p>
+                            </div>
+
+                            <!-- 6. 计次开关与阈值 -->
+                            <div class="form-field">
+                                <label class="field-label" for="enable_violation_count">
+                                    <span>违规发言计次开关</span>
+                                    <input type="checkbox" class="switch" id="enable_violation_count"
+                                           name="enable_violation_count">
+                                </label>
+                                <p class="field-hint">开启后，监听中成员违规发言将累加违规次数，达上限后自动踢出；关闭后不计次也不触发踢出</p>
+                            </div>
+
+                            <div class="form-field">
+                                <label class="field-label" for="kick_threshold">违规踢出阈值（次数）</label>
+                                <input type="number" class="field-input" id="kick_threshold"
+                                       name="kick_threshold" min="2" max="100" value="7">
+                                <p class="field-hint">开启计次开关后，未解除监听状态下累计违规达到该次数时，自动将该用户移出本群</p>
+                            </div>
+
+                            <!-- 戳一戳快速解禁 -->
+                            <div class="form-field">
+                                <label class="field-label" for="enable_poke_whitelist">
+                                    <span>允许戳一戳解禁</span>
+                                    <input type="checkbox" class="switch" id="enable_poke_whitelist"
+                                           name="enable_poke_whitelist">
+                                </label>
+                                <p class="field-hint">开启后，受监控的新成员可通过在群内戳一戳机器人快速解除限制</p>
+                            </div>
+                        </section>
+
+                        <!-- 分段递进禁言时长 -->
+                        <section class="form-section">
+                            <h3 class="section-title">分段递进禁言时长设置</h3>
+
+                            <div class="grid-2col">
+                                <div class="form-field">
+                                    <label class="field-label" for="ban_duration_1">第 1-2 次违规时长（秒）</label>
+                                    <input type="number" class="field-input" id="ban_duration_1"
+                                           name="ban_duration_1" min="10" max="2592000" value="180">
+                                </div>
+
+                                <div class="form-field">
+                                    <label class="field-label" for="ban_duration_2">第 3 次违规时长（秒）</label>
+                                    <input type="number" class="field-input" id="ban_duration_2"
+                                           name="ban_duration_2" min="10" max="2592000" value="180">
+                                </div>
+
+                                <div class="form-field">
+                                    <label class="field-label" for="ban_duration_3">第 4 次违规时长（秒）</label>
+                                    <input type="number" class="field-input" id="ban_duration_3"
+                                           name="ban_duration_3" min="10" max="2592000" value="600">
+                                </div>
+
+                                <div class="form-field">
+                                    <label class="field-label" for="ban_duration_4">第 5 次及以后时长（秒）</label>
+                                    <input type="number" class="field-input" id="ban_duration_4"
+                                           name="ban_duration_4" min="10" max="2592000" value="3600">
+                                </div>
+                            </div>
+                        </section>
+
+                        <!-- 验证模式与题目设置 -->
+                        <section class="form-section">
+                            <h3 class="section-title">入群验证模式与题目设置</h3>
+
+                            <div class="form-field">
+                                <label class="field-label" for="verify_mode">入群验证模式</label>
+                                <select class="field-input" id="verify_mode" name="verify_mode">
+                                    <option value="keyword">指定关键词/固定文本验证 (发送包含设定词句的消息)</option>
+                                    <option value="math_add_sub">加减算术计算验证 (随机生成加减法算式)</option>
+                                    <option value="math_mul_div">乘除算术计算验证 (随机生成乘除法算式)</option>
+                                    <option value="custom_qa">自定义问答/诗词填空验证 (从题库随机抽取问答题)</option>
+                                </select>
+                                <p class="field-hint">选择新成员入群解除禁言时需要完成的验证考核方式</p>
+                            </div>
+
+                            <!-- 关键词模式配置 -->
+                            <div class="form-field" id="field-whitelist-keywords">
+                                <label class="field-label" for="whitelist_keywords">解除监听指定关键词/语句</label>
+                                <input type="text" class="field-input" id="whitelist_keywords"
+                                       name="whitelist_keywords" value="我已阅读并同意遵守群规">
+                                <p class="field-hint">新成员发送包含这些关键词的消息即可解禁。多个关键词可用逗号或换行分隔</p>
+                            </div>
+
+                            <!-- 自定义问答/诗词填空配置 -->
+                            <div class="form-field" id="field-custom-qa" style="display: none;">
+                                <label class="field-label" for="custom_qa_list">自定义问答/诗词填空题库</label>
+                                <textarea class="field-textarea" id="custom_qa_list"
+                                          name="custom_qa_list" rows="5"
+                                          placeholder="床前明月光|疑是地上霜&#10;天王盖地虎|宝塔镇河妖&#10;本群主题是什么|技术交流"></textarea>
+                                <p class="field-hint">每行一道题目，格式为：【问题|答案】（支持以竖线、冒号分隔）。新成员入群时系统随机抽选一道提问</p>
+                            </div>
+
+                            <!-- 计算模式说明提示 -->
+                            <div class="form-field" id="field-math-hint" style="display: none;">
+                                <div class="info-banner">
+                                    <span class="info-title">计算模式说明:</span>
+                                    <span>系统在新成员入群时自动生成随机数学算式并随欢迎消息发送，新成员在群内发言包含或完全匹配正确结果数字即可解除限制。</span>
+                                </div>
+                            </div>
+                        </section>
+
+                        <!-- 关键词与提示词 -->
+                        <section class="form-section">
+                            <h3 class="section-title">消息模板配置</h3>
+
+                            <div class="placeholder-guide">
+                                <div class="guide-title">可用动态占位符（支持在欢迎消息与各次违规提示中重复引用）：</div>
+                                <div class="guide-grid">
+                                    <span><code>{question}</code> 或 <code>{验证题目}</code> : 随机验证题目</span>
+                                    <span><code>{random}</code> 或 <code>{随机内容}</code> : 防重发随机字符</span>
+                                    <span><code>{duration}</code> 或 <code>{禁言时长}</code> : 禁言秒数</span>
+                                    <span><code>{count}</code> 或 <code>{违规次数}</code> : 当前违规次数</span>
+                                    <span><code>{threshold}</code> 或 <code>{踢出阈值}</code> : 踢出上限阈值</span>
+                                    <span><code>{user}</code> 或 <code>{用户}</code> : 成员 QQ 号码</span>
+                                </div>
+                            </div>
+
+                            <div class="form-field">
+                                <label class="field-label" for="welcome_message">入群欢迎提示语</label>
+                                <textarea class="field-textarea" id="welcome_message"
+                                          name="welcome_message" rows="3"></textarea>
+                                <p class="field-hint">新成员入群时机器人发送的欢迎词，用于引导阅读群规与完成解禁。支持使用 {question} 放置随机题目、{random} 放置防重发字符</p>
+                            </div>
+
+                            <div class="form-field">
+                                <label class="field-label" for="whitelist_success_message">验证成功解禁提示</label>
+                                <textarea class="field-textarea" id="whitelist_success_message"
+                                          name="whitelist_success_message" rows="2"></textarea>
+                                <p class="field-hint">新成员验证通过后的提示消息，留空则不发送提示</p>
+                            </div>
+
+                            <div class="form-field">
+                                <label class="field-label" for="poke_whitelist_message">戳一戳解禁成功提示</label>
+                                <textarea class="field-textarea" id="poke_whitelist_message"
+                                          name="poke_whitelist_message" rows="2"></textarea>
+                                <p class="field-hint">通过戳一戳解除限制后的提示消息，留空则不发送提示</p>
+                            </div>
+
+                            <div class="form-field">
+                                <label class="field-label" for="kick_message">违规达到上限踢出提示</label>
+                                <textarea class="field-textarea" id="kick_message"
+                                          name="kick_message" rows="2"></textarea>
+                            </div>
+
+                            <div class="form-field">
+                                <label class="field-label" for="ban_message_1">第 1-2 次违规惩罚提示</label>
+                                <textarea class="field-textarea" id="ban_message_1"
+                                          name="ban_message_1" rows="2"></textarea>
+                            </div>
+
+                            <div class="form-field">
+                                <label class="field-label" for="ban_message_2">第 3 次违规惩罚提示</label>
+                                <textarea class="field-textarea" id="ban_message_2"
+                                          name="ban_message_2" rows="2"></textarea>
+                            </div>
+
+                            <div class="form-field">
+                                <label class="field-label" for="ban_message_3">第 4 次违规惩罚提示</label>
+                                <textarea class="field-textarea" id="ban_message_3"
+                                          name="ban_message_3" rows="2"></textarea>
+                            </div>
+
+                            <div class="form-field">
+                                <label class="field-label" for="ban_message_4">第 5 次及以后惩罚提示</label>
+                                <textarea class="field-textarea" id="ban_message_4"
+                                          name="ban_message_4" rows="2"></textarea>
+                            </div>
+                        </section>
+
+                        <!-- 表单提交操作栏 -->
+                        <div class="form-actions">
+                            <button type="submit" class="btn-primary btn-large" id="btn-save">保存当前群配置</button>
+                            <button type="button" class="btn-secondary btn-large" id="btn-reset">重置表单修改</button>
+                        </div>
+                    </form>
+
+                    <!-- 受监控成员管理 -->
+                    <section class="form-section mt-24">
+                        <div class="section-header-flex">
+                            <h3 class="section-title mb-0">本群当前受监控成员</h3>
+                            <button type="button" class="btn-secondary btn-sm" id="btn-refresh-users">刷新成员列表</button>
+                        </div>
+                        <p class="field-hint mb-16">处于监控列表中的成员未完成解禁流程，在此可手动取消对其的监控。</p>
+                        <div class="monitored-users" id="monitored-users">
+                            <div class="loading-state">正在加载监控名单...</div>
+                        </div>
+                    </section>
+                </div>
+            </main>
+        </div>
+
+        <!-- 浮层通知容器 -->
+        <div class="toast-container" id="toast-container"></div>
+    </div>
+
+    <script type="module" src="./app.js"></script>
+</body>
+</html>

@@ -1,1205 +1,717 @@
-import asyncio
-import json
-import time
-from collections.abc import AsyncGenerator
-from functools import wraps
-from pathlib import Path
-from typing import Optional
+"""
+AstrBot 进群禁言插件 v2.0
 
-import astrbot.api.message_components as Comp
+功能特性:
+- 新成员入群自动禁言并发送欢迎引导消息
+- 支持关键词解禁和戳一戳 Bot 快速解禁
+- 递进式阶梯禁言机制
+- 达到违规次数上限自动踢出
+- 分群独立配置与 SQLite 数据库持久化存储
+- 现代化 WebUI 可视化管理面板
+"""
+import asyncio
+import random
+import re
+from pathlib import Path
+from typing import Optional, Dict, List, Any, Tuple
+
 from astrbot.api import logger
-from astrbot.api.event import MessageEventResult, filter
-from astrbot.api.star import Context, Star, register
-from astrbot.core import AstrBotConfig
-from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
-    AiocqhttpMessageEvent,
-)
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.star import Context, Star
+import astrbot.api.message_components as Comp
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
+from .database import AutoBanDatabase
+from .web_controller import WebController
 
-# 权限组内容参考https://github.com/Zhalslar/astrbot_plugin_QQAdmin
-class PermLevel:
-    """权限级别枚举类"""
 
-    UNKNOWN = -1
-    MEMBER = 0
-    HIGH = 1
-    ADMIN = 2
-    OWNER = 3
-    SUPERUSER = 4
+def generate_verification_challenge(config: Dict[str, Any]) -> Tuple[str, str]:
+    """根据群配置的验证模式生成验证题目与期望答案。
 
-    @classmethod
-    def from_str(cls, s: str) -> "PermLevel":
-        s = s.lower()
-        if s == "superuser":
-            return cls.SUPERUSER
-        elif s == "owner":
-            return cls.OWNER
-        elif s == "admin":
-            return cls.ADMIN
-        elif s == "high":
-            return cls.HIGH
-        elif s == "member":
-            return cls.MEMBER
+    返回: (question_prompt, expected_answer)
+    模式支持:
+    - keyword: 指定关键词模式（不预设固定答案）
+    - math_add_sub: 加减计算验证
+    - math_mul_div: 乘除计算验证
+    - custom_qa: 自定义问答 / 诗词填空
+    """
+    mode = str(config.get("verify_mode", "keyword")).strip().lower()
+
+    if mode == "math_add_sub":
+        # 10~99 范围内的整数加减法
+        op = random.choice(["+", "-"])
+        if op == "+":
+            a = random.randint(10, 80)
+            b = random.randint(5, 80)
+            ans = a + b
+            return f"{a} + {b} = ?", str(ans)
         else:
-            return cls.UNKNOWN
+            a = random.randint(20, 99)
+            b = random.randint(5, a - 5)
+            ans = a - b
+            return f"{a} - {b} = ?", str(ans)
 
-
-class PermissionManager:
-    """权限管理器单例类"""
-
-    _instance: Optional["PermissionManager"] = None
-
-    def __new__(cls, *args, **kwargs):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._initialized = False
-        return cls._instance
-
-    def __init__(
-        self,
-        superusers: list[str] | None = None,
-        perms: dict[str, str] | None = None,
-        level_threshold: int = 10,
-    ):
-        if self._initialized:
-            return
-        self.superusers = superusers or []
-        self.perms: dict[str, PermLevel] = {
-            k: PermLevel.from_str(v) for k, v in (perms or {}).items()
-        }
-        self.level_threshold = level_threshold
-        self._initialized = True
-
-    @classmethod
-    def get_instance(
-        cls,
-        superusers: list[str] | None = None,
-        perms: dict[str, str] | None = None,
-        level_threshold: int = 50,
-    ) -> "PermissionManager":
-        if cls._instance is None:
-            cls._instance = cls(
-                superusers=superusers,
-                perms=perms,
-                level_threshold=level_threshold,
-            )
-        return cls._instance
-
-    async def get_perm_level(
-        self, event: AiocqhttpMessageEvent, user_id: str | int
-    ) -> PermLevel:
-        """获取用户在群内的权限级别"""
-        group_id = event.get_group_id()
-        if int(group_id) == 0 or int(user_id) == 0:
-            return PermLevel.UNKNOWN
-        if str(user_id) in self.superusers:
-            return PermLevel.SUPERUSER
-        try:
-            info = await event.bot.get_group_member_info(
-                group_id=int(group_id), user_id=int(user_id), no_cache=True
-            )
-        except Exception:
-            return PermLevel.UNKNOWN
-        role = info.get("role", "unknown")
-        level = int(info.get("level", 0))
-
-        if role == "owner":
-            return PermLevel.OWNER
-        elif role == "admin":
-            return PermLevel.ADMIN
-        elif role == "member":
-            return PermLevel.HIGH if level >= self.level_threshold else PermLevel.MEMBER
+    elif mode == "math_mul_div":
+        # 乘法或可整除的除法
+        op = random.choice(["*", "/"])
+        if op == "*":
+            a = random.randint(2, 12)
+            b = random.randint(2, 9)
+            ans = a * b
+            return f"{a} × {b} = ?", str(ans)
         else:
-            return PermLevel.UNKNOWN
+            b = random.randint(2, 9)
+            ans = random.randint(2, 12)
+            a = b * ans
+            return f"{a} ÷ {b} = ?", str(ans)
+
+    elif mode == "custom_qa":
+        # 自定义问答 / 诗词填空
+        qa_text = str(config.get("custom_qa_list", "") or "").strip()
+        pairs = []
+        if qa_text:
+            for line in qa_text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                for sep in ["|", "｜", ":", "："]:
+                    if sep in line:
+                        q, a = line.split(sep, 1)
+                        if q.strip() and a.strip():
+                            pairs.append((q.strip(), a.strip()))
+                        break
+
+        if pairs:
+            q, a = random.choice(pairs)
+            return f"请回答：【{q}】", a
+        else:
+            return "请回答：【床前明月光】", "疑是地上霜"
+
+    # keyword 模式直接通过关键词白名单判定
+    return "", ""
 
 
-# 权限检查装饰器
-def perm_required(required_level: PermLevel, check_at: bool = True):
-    """检查用户权限的装饰器"""
+def check_verification_answer(user_message: str, mode: str, expected_answer: str, config: Dict[str, Any]) -> bool:
+    """根据验证模式校验用户发言是否满足解除监听条件"""
+    mode = str(mode).strip().lower()
+    user_text = user_message.strip()
 
-    def decorator(func):
-        @wraps(func)
-        async def wrapper(self, event: AiocqhttpMessageEvent, *args, **kwargs):
-            # 非群聊环境直接拒绝
-            if not event.get_group_id():
-                yield event.plain_result("此命令仅在群聊中可用")
-                return
+    if mode in ("math_add_sub", "math_mul_div"):
+        if not expected_answer:
+            return True
+        # 去除所有空格后严格匹配或正则单词边界匹配
+        clean_text = user_text.replace(" ", "")
+        if clean_text == expected_answer:
+            return True
+        pattern = rf"(?<!\d){re.escape(expected_answer)}(?!\d)"
+        return bool(re.search(pattern, user_text))
 
-            perm_mgr = PermissionManager.get_instance()
-            user_level = await perm_mgr.get_perm_level(event, event.get_sender_id())
+    elif mode == "custom_qa":
+        if not expected_answer:
+            return True
+        ans = expected_answer.strip().lower()
+        return ans in user_text.lower()
 
-            # 检查用户权限
-            if user_level < required_level:
-                required_str = {
-                    PermLevel.SUPERUSER: "超级管理员",
-                    PermLevel.OWNER: "群主",
-                    PermLevel.ADMIN: "管理员",
-                    PermLevel.HIGH: "高等级成员",
-                    PermLevel.MEMBER: "普通成员",
-                }.get(required_level, "未知权限")
-                yield event.plain_result(f"抱歉哦，需要{required_str}权限才可以设置~")
-                return
-
-            # 执行原函数
-            async for result in func(self, event, *args, **kwargs):
-                yield result
-
-        return wrapper
-
-    return decorator
+    else:
+        # keyword 模式校验白名单关键词
+        whitelist_raw = config.get("whitelist_keywords", "我已阅读并同意遵守群规")
+        keywords = [k.strip() for k in re.split(r"[,，\n]+", str(whitelist_raw)) if k.strip()]
+        return any(kw.lower() in user_text.lower() for kw in keywords)
 
 
-# 高优先级常量，确保事件处理优先级
-PRIO_HIGH = 100
+def format_template_message(
+    template: str,
+    user_id: str = "",
+    question: str = "",
+    count: int = 1,
+    duration: int = 0,
+    threshold: int = 7,
+    append_question_fallback: bool = False
+) -> str:
+    """格式化消息模板，替换所有占位符并支持防重发随机内容。
+
+    支持占位符:
+    - {question} 或 {题目} 或 {验证题目}: 随机验证题目内容
+    - {random} 或 {随机} 或 {随机内容}: 每次均不同的防重发随机字符
+    - {user} 或 {用户} 或 {qq}: 成员 QQ 号
+    - {count} 或 {次数} 或 {违规次数}: 当前违规次数
+    - {duration} 或 {时长} 或 {禁言时长}: 禁言秒数
+    - {threshold} 或 {阈值} 或 {踢出阈值}: 踢出上限阈值
+    - {at} 或 {at_user} 或 {艾特}: 艾特该成员
+    """
+    if not template:
+        return ""
+
+    # 随机生成 4 位防重发字符串（避免平台因连续多条完全相同消息触发去重或风控拦截）
+    random_code = "".join(random.choices("abcdefhkmnprstuvwxyz23456789", k=4))
+
+    text = template
+
+    replacements = {
+        "{at}": f"[CQ:at,qq={user_id}]",
+        "{at_user}": f"[CQ:at,qq={user_id}]",
+        "{艾特}": f"[CQ:at,qq={user_id}]",
+        "{question}": question,
+        "{题目}": question,
+        "{验证题目}": question,
+        "{random}": random_code,
+        "{随机}": random_code,
+        "{随机内容}": random_code,
+        "{user}": user_id,
+        "{用户}": user_id,
+        "{qq}": user_id,
+        "{count}": str(count),
+        "{次数}": str(count),
+        "{违规次数}": str(count),
+        "{duration}": str(duration),
+        "{时长}": str(duration),
+        "{禁言时长}": str(duration),
+        "{threshold}": str(threshold),
+        "{阈值}": str(threshold),
+        "{踢出阈值}": str(threshold),
+    }
+
+    for placeholder, val in replacements.items():
+        if placeholder in text:
+            text = text.replace(placeholder, str(val))
+
+    # 仅当显式指定 append_question_fallback=True（如入群欢迎或违规警告）且模版未显式填写题目占位符时才兜底追加
+    if append_question_fallback and question and not any(k in template for k in ("{question}", "{题目}", "{验证题目}")):
+        text += f"\n【验证题目】{question}（请回复正确答案以解除限制）"
+
+    return text.strip()
 
 
-def _high_priority(deco):
-    """装饰器包装器，为事件处理器设置高优先级"""
+class Main(Star):
+    """进群禁言插件主类"""
 
-    @wraps(deco)
-    def wrapper(*args, **kwargs):
-        kwargs.setdefault("priority", PRIO_HIGH)
-        return deco(*args, **kwargs)
-
-    return wrapper
-
-
-# 高优先级事件装饰器
-high_priority_event = _high_priority(filter.event_message_type)
-
-
-def parse_switch_value(value: str) -> bool | None:
-    """解析 on/off 类命令参数。"""
-    normalized = value.strip().lower()
-    if normalized in {"on", "true", "1", "yes", "y", "开启", "启用", "开"}:
-        return True
-    if normalized in {"off", "false", "0", "no", "n", "关闭", "禁用", "关"}:
-        return False
-    return None
-
-
-@register(
-    "astrbot_plugin_auto_ban_new",
-    "糯米茨",
-    "在指定群聊中对新入群用户自动禁言并发送欢迎消息，支持多种方式解除监听。",
-    "v1.5",
-)
-class AutoBanNewMemberPlugin(Star):
-    def __init__(self, context: Context, config: AstrBotConfig = None):
+    def __init__(self, context: Context):
         super().__init__(context)
-        self.config = config or {}
+        self.context = context
+        self.config = context.get_config()
 
-        # 初始化权限管理器
-        self.admins_id = context.get_config().get("admins_id", [])
-        self.perm_level_threshold = self.config.get("level_threshold", 50)
-        self.permissions = self.config.get("permissions", {})
+        # 初始化数据库路径
+        db_dir = Path(get_astrbot_data_path()) / "plugin_data" / "astrbot_plugin_auto_ban_new"
+        db_dir.mkdir(parents=True, exist_ok=True)
+        self.db_path = db_dir / "auto_ban.db"
+        self.db = AutoBanDatabase(self.db_path)
 
-        PermissionManager.get_instance(
-            superusers=self.admins_id,
-            perms=self.permissions,
-            level_threshold=self.perm_level_threshold,
-        )
+        # 后台巡检任务状态
+        self._periodic_check_task: Optional[asyncio.Task] = None
+        self._is_running = False
 
-        # 读取基础配置
-        self.target_groups = set(self.config.get("target_groups", []))
+        # 初始化 WebUI 控制器
+        self.web_controller = WebController(context, self.db)
 
-        # 新增：是否启用后续发言监测功能（默认关闭）
-        self.enable_follow_up_monitoring = self.config.get(
-            "enable_follow_up_monitoring", False
-        )
-        self.enable_recall_noncompliant_messages = self.config.get(
-            "enable_recall_noncompliant_messages", False
-        )
-
-        # 构建禁言时长列表，提供默认值防止配置缺失
-        ban_durations_config = self.config.get("ban_durations", {})
-        self.ban_durations = [
-            ban_durations_config.get("first_ban") or 180,
-            ban_durations_config.get("second_ban") or 180,
-            ban_durations_config.get("third_ban") or 600,
-            ban_durations_config.get("fourth_and_more_ban") or 3600,
-        ]
-
-        # 读取消息配置，提供默认值
-        self.welcome_message = self.config.get("welcome_message") or (
-            "欢迎加入本群！为了保证你能静下心看一眼群规你已被自动禁言3分钟。"
-            "\n请先查看群规，并阅读群公告。看完了还有问题可以@我"
-        )
-
-        ban_messages_config = self.config.get("ban_messages", {})
-        self.ban_messages = [
-            ban_messages_config.get("first_message")
-            or "请先查看群规再发言，不要着急哦。",
-            ban_messages_config.get("second_message")
-            or "请先阅读群规和欢迎词内容，这次还是3分钟禁言~",
-            ban_messages_config.get("third_message")
-            or "多次未查看群规，禁言时间延长至10分钟，请认真阅读群规！",
-            ban_messages_config.get("fourth_and_more_message")
-            or "禁言时间固定为1小时，请认真阅读群规后再发言！",
-        ]
-
-        # 读取白名单关键词及提示配置
-        self.whitelist_keywords = self.config.get("whitelist_keywords", [])
-        self.whitelist_success_message = self.config.get("whitelist_success_message")
-        if self.whitelist_success_message is None:
-            self.whitelist_success_message = (
-                "检测到您已阅读群规，已取消监控，欢迎正常发言~"
-            )
-
-        # 读取戳一戳功能配置
-        self.enable_poke_whitelist = self.config.get("enable_poke_whitelist", True)
-        self.poke_whitelist_message = (
-            self.config.get("poke_whitelist_message")
-            or "检测到戳一戳，已为您解除自动禁言监听~"
-        )
-
-        # 新增：踢出功能配置
-        self.kick_threshold = self.config.get("kick_threshold", 7)
-        self.kick_message = self.config.get("kick_message") or (
-            '由于多次不看群规，你已被标记为"恶意用户"，现在踢出。你可以重新添加，但请记得查阅群规后再发言。'
-        )
-
-        # 用户禁言记录存储 (群ID, 用户ID): 累计禁言次数
-        self.banned_users = {}
-
-        # 使用框架标准方式获取数据目录
-        self.data_dir = (
-            Path(get_astrbot_data_path())
-            / "plugin_data"
-            / "astrbot_plugin_auto_ban_new"
-        )
-        self.data_file = self.data_dir / "banned_users.json"
-
-        # 检查并迁移旧数据目录的数据（如果存在）
-        self._migrate_old_data()
-
-        # 后台任务状态标记，防止重复启动定时任务
-        self._periodic_task_started = False
+        logger.info("[AutoBan] 插件实例已创建")
 
     async def initialize(self):
-        """插件初始化"""
-        try:
-            self.data_dir.mkdir(parents=True, exist_ok=True)
-            self._load_banned_users()
-            # 只有启用后续监测时才启动定期检查任务
-            if self.enable_follow_up_monitoring:
-                asyncio.create_task(self.periodic_member_check())
-                self._periodic_task_started = True
-                logger.info(
-                    "自动禁言新成员插件已初始化，后续发言监测功能已启用，成功加载历史数据并启动后台检查任务"
-                )
-            else:
-                logger.info(
-                    "自动禁言新成员插件已初始化，后续发言监测功能已关闭，仅对新成员进行入群禁言"
-                )
-        except PermissionError as e:
-            logger.error(f"初始化插件时权限不足: {e}")
-        except OSError as e:
-            logger.error(f"初始化插件时文件系统错误: {e}")
-        except Exception as e:
-            logger.error(f"初始化插件时出现未预期的错误: {e}")
+        """插件生命周期：初始化"""
+        await self.db.initialize()
+
+        # 注册 WebUI 路由
+        self.web_controller.register_routes()
+
+        # 启动后台定期巡检任务
+        self._is_running = True
+        self._periodic_check_task = asyncio.create_task(self._periodic_member_check())
+
+        logger.info("[AutoBan] 插件初始化完成，后台巡检任务已启动")
 
     async def terminate(self):
-        """插件终止时保存数据"""
-        try:
-            if self.enable_follow_up_monitoring:
-                self._save_banned_users()
-                logger.info("自动禁言新成员插件已终止，成功保存数据")
-            else:
-                logger.info("自动禁言新成员插件已终止")
-        except PermissionError as e:
-            logger.error(f"终止插件时权限不足，无法保存数据: {e}")
-        except OSError as e:
-            logger.error(f"终止插件时文件系统错误: {e}")
-        except Exception as e:
-            logger.error(f"终止插件时出现未预期的错误: {e}")
+        """插件生命周期：终止与清理"""
+        self._is_running = False
 
-    def _migrate_old_data(self):
-        """检查并迁移旧数据目录的数据文件"""
-        try:
-            import shutil
+        if self._periodic_check_task and not self._periodic_check_task.done():
+            self._periodic_check_task.cancel()
+            try:
+                await self._periodic_check_task
+            except asyncio.CancelledError:
+                pass
 
-            from astrbot.core.star.star_tools import StarTools
+        logger.info("[AutoBan] 插件已终止，资源释放完毕")
 
-            old_data_dir = StarTools.get_data_dir("astrbot_plugin_auto_ban_new")
-            old_data_file = old_data_dir / "banned_users.json"
+    # ==================== 统一事件监听器 ====================
 
-            # 如果旧数据文件存在且新数据文件不存在，则迁移数据
-            if old_data_file.exists() and not self.data_file.exists():
-                self.data_dir.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(old_data_file, self.data_file)
-                logger.info(f"已将旧数据文件从 {old_data_file} 迁移到 {self.data_file}")
-        except ImportError:
-            # StarTools 不存在，跳过迁移
-            logger.debug("StarTools 不可用，跳过旧数据迁移")
-        except Exception as e:
-            logger.warning(f"迁移旧数据时出错: {e}")
-
-    def _load_banned_users(self):
-        """从文件加载被禁言用户数据"""
-        # 如果未启用后续监测，则不需要加载历史数据
-        if not self.enable_follow_up_monitoring:
-            self.banned_users = {}
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=100)
+    async def handle_aiocqhttp_event(self, event: AstrMessageEvent):
+        """统一监听来自 aiocqhttp (OneBot) 平台的事件"""
+        raw = getattr(event.message_obj, "raw_message", None)
+        if not isinstance(raw, dict):
             return
 
-        try:
-            if self.data_file.exists():
-                with open(self.data_file, encoding="utf-8") as f:
-                    data = json.load(f)
-                self.banned_users = {}
-                for item in data:
-                    if not isinstance(item, list) or len(item) != 2:
-                        continue
-                    key_list, count = item
-                    if not isinstance(key_list, list) or len(key_list) != 2:
-                        continue
-                    group_id, user_id = key_list
-                    try:
-                        group_id = str(group_id)
-                        user_id = int(user_id)
-                    except (TypeError, ValueError):
-                        continue
-                    self.banned_users[(group_id, user_id)] = count
-                logger.debug(
-                    f"从{self.data_file}加载了{len(self.banned_users)}个被禁言用户"
-                )
-            else:
-                self.banned_users = {}
-        except Exception as e:
-            logger.error(f"加载被禁言用户数据失败: {e}")
-            self.banned_users = {}
+        post_type = raw.get("post_type")
 
-    def _save_banned_users(self):
-        """将被禁言用户数据保存到文件"""
-        # 如果未启用后续监测，则不需要保存数据
-        if not self.enable_follow_up_monitoring:
-            return
+        # 1. OneBot 通知事件（入群、退群、戳一戳）
+        if post_type == "notice":
+            notice_type = raw.get("notice_type")
+            if notice_type == "group_increase":
+                await self._handle_group_increase(event, raw)
+            elif notice_type == "group_decrease":
+                await self._handle_group_decrease(event, raw)
+            elif notice_type == "notify" and raw.get("sub_type") == "poke":
+                await self._handle_poke(event, raw)
 
-        try:
-            data = []
-            for key, value in self.banned_users.items():
-                group_id, user_id = key
-                data.append([[str(group_id), int(user_id)], value])
-            with open(self.data_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            logger.debug(
-                f"已将{len(self.banned_users)}个被禁言用户保存到{self.data_file}"
-            )
-        except Exception as e:
-            logger.error(f"保存被禁言用户数据失败: {e}")
+        # 2. OneBot 消息事件（被监控群员消息拦截、白名单关键词匹配）
+        elif post_type == "message":
+            if raw.get("message_type") == "group":
+                await self._handle_monitored_user_message(event, raw)
 
-    def check_target_group(self, group_id: str) -> bool:
-        """检查是否为目标群聊"""
-        return group_id in self.target_groups
+    # ==================== 业务处理逻辑 ====================
 
-    def is_valid_message(self, event: AiocqhttpMessageEvent) -> bool:
-        """判断消息是否为有效消息，排除戳一戳等特殊消息"""
-        try:
-            message_components = event.get_messages()
-            message_outline = event.get_message_outline()
-            if "[poke]" in message_outline:
-                return False
-            if message_components:
-                return any(not isinstance(seg, Comp.Poke) for seg in message_components)
-
-            raw_message = getattr(event.message_obj, "raw_message", None)
-            raw_segments = (
-                raw_message.get("message") if isinstance(raw_message, dict) else None
-            )
-            if isinstance(raw_segments, list):
-                return any(
-                    seg.get("type") != "poke"
-                    for seg in raw_segments
-                    if isinstance(seg, dict)
-                )
-            return False
-        except Exception as e:
-            logger.error(f"判断消息有效性时出错: {e}")
-            return True
-
-    async def recall_noncompliant_message(
-        self, event: AiocqhttpMessageEvent, group_id: str, user_id: int
-    ) -> None:
-        """按配置撤回被监听用户未按要求发送的消息。"""
-        if not self.enable_recall_noncompliant_messages:
-            return
-
-        message_id = getattr(event.message_obj, "message_id", None)
-        if message_id in (None, ""):
-            logger.warning(
-                f"用户 {user_id} 在群 {group_id} 的违规发言缺少 message_id，无法撤回。"
-            )
-            return
-
-        try:
-            await event.bot.delete_msg(message_id=int(message_id))
-            logger.info(
-                f"已撤回用户 {user_id} 在群 {group_id} 中未按要求发送的消息 {message_id}。"
-            )
-        except (TypeError, ValueError):
-            logger.warning(
-                f"用户 {user_id} 在群 {group_id} 的违规发言 message_id 非数字，无法撤回: {message_id!r}"
-            )
-        except Exception as e:
-            logger.warning(
-                f"撤回用户 {user_id} 在群 {group_id} 中未按要求发送的消息 {message_id} 失败: {e}"
-            )
-
-    async def get_mute_remaining_seconds(
-        self, event: AiocqhttpMessageEvent, group_id: str, user_id: int
-    ) -> int | None:
-        """获取群成员当前剩余禁言时间，查询失败时返回 None。"""
-        try:
-            member_info = await event.bot.get_group_member_info(
-                group_id=int(group_id), user_id=int(user_id), no_cache=True
-            )
-        except Exception as e:
-            logger.warning(
-                f"查询用户 {user_id} 在群 {group_id} 的禁言状态失败，将继续按本插件规则处理: {e}"
-            )
-            return None
-
-        try:
-            shut_up_timestamp = int(member_info.get("shut_up_timestamp") or 0)
-        except (TypeError, ValueError):
-            logger.warning(
-                f"用户 {user_id} 在群 {group_id} 的禁言状态字段异常: {member_info.get('shut_up_timestamp')!r}"
-            )
-            return None
-
-        if shut_up_timestamp <= 0:
-            return 0
-        return max(0, shut_up_timestamp - int(time.time()))
-
-    def remove_user_from_watchlist(self, user_identifier: tuple, reason: str) -> bool:
-        """从监听列表中移除用户"""
-        group_id, user_id = user_identifier
-        if user_identifier in self.banned_users:
-            del self.banned_users[user_identifier]
-            self._save_banned_users()
-            logger.info(f'用户 {user_id} 在群 {group_id} 中因"{reason}"被解除监听')
-            return True
-        return False
-
-    @high_priority_event(filter.EventMessageType.ALL)
-    async def handle_group_increase(self, event: AiocqhttpMessageEvent):
+    async def _handle_group_increase(self, event: AstrMessageEvent, raw: dict):
         """处理新成员入群事件"""
-        try:
-            if not hasattr(event, "message_obj") or not hasattr(
-                event.message_obj, "raw_message"
-            ):
-                return
-            raw_message = event.message_obj.raw_message
-            if not raw_message or not isinstance(raw_message, dict):
-                return
+        group_id = str(raw.get("group_id", "") or "").strip()
+        user_id = str(raw.get("user_id", "") or "").strip()
+        self_id = str(event.get_self_id() or "").strip()
 
-            # 检查是否为群成员增加通知
-            if (
-                raw_message.get("post_type") == "notice"
-                and raw_message.get("notice_type") == "group_increase"
-            ):
-                group_id = str(raw_message.get("group_id", ""))
-                user_id = int(raw_message.get("user_id", 0))
-
-                # 非目标群直接返回
-                if not self.check_target_group(group_id):
-                    return
-
-                try:
-                    # 新成员入群：执行第1次禁言
-                    user_identifier = (group_id, user_id)
-                    first_ban_duration = self.ban_durations[0]
-                    await event.bot.set_group_ban(
-                        group_id=int(group_id),
-                        user_id=user_id,
-                        duration=first_ban_duration,
-                    )
-                    logger.info(
-                        f"已在群{group_id}中第1次禁言新成员{user_id}，时长{first_ban_duration}秒"
-                    )
-
-                    # 只有启用后续监测时才记录用户到监听列表
-                    if self.enable_follow_up_monitoring:
-                        self.banned_users[user_identifier] = 1
-                        self._save_banned_users()
-                        logger.debug(
-                            f"已添加用户到监听列表：{user_identifier}，累计禁言次数：1"
-                        )
-                    else:
-                        logger.debug(
-                            f"后续发言监测功能已关闭，不将用户{user_id}添加到监听列表"
-                        )
-
-                    # 发送欢迎消息
-                    chain = [Comp.At(qq=user_id), Comp.Plain(text=self.welcome_message)]
-                    yield event.chain_result(chain)
-
-                except Exception as e:
-                    logger.error(f"处理新成员入群事件出错: {e}")
-        except Exception as e:
-            logger.error(f"handle_group_increase 方法出错: {e}")
-
-    @high_priority_event(filter.EventMessageType.ALL)
-    async def handle_group_decrease(self, event: AiocqhttpMessageEvent):
-        """处理群成员减少事件（主动退群或被踢）"""
-        # 如果未启用后续监测，则不需要处理成员减少事件
-        if not self.enable_follow_up_monitoring:
+        if not group_id or not user_id:
             return
 
-        try:
-            if not hasattr(event, "message_obj") or not hasattr(
-                event.message_obj, "raw_message"
-            ):
-                return
-            raw_message = event.message_obj.raw_message
-            if not isinstance(raw_message, dict):
-                return
-
-            # 检查是否为群成员减少通知
-            if (
-                raw_message.get("post_type") == "notice"
-                and raw_message.get("notice_type") == "group_decrease"
-            ):
-                group_id = str(raw_message.get("group_id", ""))
-                user_id = int(raw_message.get("user_id", 0))
-
-                # 非目标群直接返回
-                if not self.check_target_group(group_id):
-                    return
-
-                user_identifier = (group_id, user_id)
-                # 如果用户在监听列表中，则移除
-                self.remove_user_from_watchlist(
-                    user_identifier, reason="成员离开或被移出群聊"
-                )
-
-        except Exception as e:
-            logger.error(f"handle_group_decrease 方法出错: {e}")
-
-    @high_priority_event(filter.EventMessageType.ALL)
-    async def handle_poke_whitelist(self, event: AiocqhttpMessageEvent):
-        """处理戳一戳解除监听事件"""
-        # 如果未启用后续监测或未启用戳一戳白名单，则直接返回
-        if not self.enable_follow_up_monitoring or not self.enable_poke_whitelist:
+        # 排除 Bot 自身入群
+        if user_id == self_id:
+            logger.info(f"[AutoBan] 机器人自身进入群 {group_id}，忽略入群事件")
             return
 
-        try:
-            # 检查是否为戳一戳消息
-            message_components = event.get_messages()
-            if not message_components or not isinstance(
-                message_components[0], Comp.Poke
-            ):
-                return
-
-            raw_message = getattr(event.message_obj, "raw_message", None)
-            if not raw_message:
-                return
-
-            target_id = raw_message.get("target_id", 0)
-            user_id = raw_message.get("user_id", 0)
-            group_id = str(raw_message.get("group_id", ""))
-            self_id = raw_message.get("self_id", 0)
-
-            # 检查是否戳的是机器人自己
-            if target_id != self_id:
-                return
-
-            # 检查是否为目标群
-            if not self.check_target_group(group_id):
-                return
-
-            user_identifier = (group_id, user_id)
-
-            # 检查用户是否在监听列表中
-            if user_identifier not in self.banned_users:
-                return
-
-            # 从监听列表中移除用户
-            if self.remove_user_from_watchlist(user_identifier, "戳一戳"):
-                # 发送解除监听提示消息
-                chain = [
-                    Comp.At(qq=user_id),
-                    Comp.Plain(text=self.poke_whitelist_message),
-                ]
-                yield event.chain_result(chain)
-
-        except Exception as e:
-            logger.error(f"处理戳一戳解除监听事件出错: {e}")
-
-    @high_priority_event(filter.EventMessageType.GROUP_MESSAGE)
-    async def handle_banned_user_message(self, event: AiocqhttpMessageEvent):
-        """处理被监听用户的群消息"""
-        # 如果未启用后续监测，则直接返回，不处理任何消息
-        if not self.enable_follow_up_monitoring:
+        # 检查群是否启用自动禁言
+        config = await self.db.get_group_config(group_id)
+        if not config or not config.get("enabled"):
             return
 
+        logger.info(f"[AutoBan] 新成员 {user_id} 加入群 {group_id}")
+
         try:
-            if not hasattr(event, "message_obj") or not hasattr(
-                event.message_obj, "raw_message"
-            ):
-                return
-            raw_message = event.message_obj.raw_message
-            if not raw_message or not isinstance(raw_message, dict):
-                return
+            # 根据群配置的验证模式生成验证题目与期望答案
+            verify_mode = str(config.get("verify_mode", "keyword")).strip().lower()
+            verify_question, verify_answer = generate_verification_challenge(config)
 
-            group_id = str(raw_message.get("group_id", ""))
-            user_id = int(raw_message.get("user_id", 0))
-            user_identifier = (group_id, user_id)
-
-            # 非目标群不处理
-            if not self.check_target_group(group_id):
-                return
-
-            # 不在监听列表中的用户不处理
-            if user_identifier not in self.banned_users:
-                return
-
-            # 检查消息中是否包含解除监听关键词
-            message_chain = event.get_messages()
-            message_text = "".join(
-                [seg.text for seg in message_chain if isinstance(seg, Comp.Plain)]
-            ).lower()
-
-            # 检查是否包含任何白名单关键词
-            has_whitelist_keyword = any(
-                keyword.lower() in message_text for keyword in self.whitelist_keywords
-            )
-
-            # 包含白名单关键词则移除监听
-            if has_whitelist_keyword:
-                removed = self.remove_user_from_watchlist(user_identifier, "关键词")
-                if removed and self.whitelist_success_message.strip():
-                    await event.send(event.plain_result(self.whitelist_success_message))
-                event.stop_event()
-                return
-
-            # 无效消息不触发禁言
-            if not self.is_valid_message(event):
-                logger.debug(f"用户{user_id}发送了无效消息，不触发禁言")
-                return
-
-            await self.recall_noncompliant_message(event, group_id, user_id)
-
-            # 有效消息且无白名单关键词则触发禁言或踢出
-            try:
-                current_total_count = self.banned_users[user_identifier]
-                duration_index = min(current_total_count, len(self.ban_durations) - 1)
-                current_ban_duration = self.ban_durations[duration_index]
-                mute_remaining = await self.get_mute_remaining_seconds(
-                    event, group_id, user_id
-                )
-
-                if mute_remaining is not None and mute_remaining > current_ban_duration:
-                    logger.info(
-                        f"跳过用户 {user_id} 在群 {group_id} 的后续禁言：当前剩余禁言 {mute_remaining} 秒，"
-                        f"超过本插件本次计划禁言 {current_ban_duration} 秒，可能已被其他禁言插件或群管操作占用。"
-                    )
-                    event.stop_event()
-                    return
-
-                if mute_remaining is not None and mute_remaining > 0:
-                    logger.info(
-                        f"用户 {user_id} 在群 {group_id} 当前仍处于禁言中，剩余 {mute_remaining} 秒未超过"
-                        f"本插件本次计划禁言 {current_ban_duration} 秒，将刷新覆盖。"
-                    )
-
-                new_total_count = current_total_count + 1
-
-                # 检查是否达到踢出阈值
-                if new_total_count >= self.kick_threshold:
-                    kick_message_chain = [
-                        Comp.At(qq=user_id),
-                        Comp.Plain(text=self.kick_message),
-                    ]
-                    await event.send(event.chain_result(kick_message_chain))
-
-                    await event.bot.set_group_kick(
-                        group_id=int(group_id),
-                        user_id=user_id,
-                        reject_add_request=False,
-                    )
-                    logger.info(
-                        f"用户 {user_id} 在群 {group_id} 中因达到 {self.kick_threshold} 次禁言上限被踢出。"
-                    )
-
-                    # 从监听列表移除用户
-                    self.remove_user_from_watchlist(user_identifier, "达到踢出阈值")
-                    event.stop_event()
-                    return  # 结束处理
-
-                # 如果未达到踢出阈值，则执行禁言
-                await event.bot.set_group_ban(
-                    group_id=int(group_id),
+            # 仅当开启后续监听时才加入监控列表（初始计数为 1，存储对应验证问题与期望答案）
+            enable_monitoring = bool(config.get("enable_follow_up_monitoring", 0))
+            if enable_monitoring:
+                await self.db.add_monitored_user(
+                    group_id=group_id,
                     user_id=user_id,
-                    duration=current_ban_duration,
+                    ban_count=1,
+                    verify_question=verify_question,
+                    verify_answer=verify_answer
                 )
-                logger.info(
-                    f"已第{new_total_count}次禁言用户{user_id}，时长{current_ban_duration}秒"
+
+            # 首次禁言开关：仅当开启首次禁言开关且时长大于 0 时执行
+            initial_duration = int(config.get("initial_ban_duration", 180))
+            if bool(config.get("enable_initial_ban", 1)) and initial_duration > 0:
+                await self._ban_user(event, group_id, user_id, initial_duration)
+                logger.info(f"[AutoBan] 已对群 {group_id} 的新成员 {user_id} 执行首次入群禁言 {initial_duration} 秒")
+            else:
+                logger.info(f"[AutoBan] 群 {group_id} 首次禁言开关已关闭或时长为0，跳过对新成员 {user_id} 的入群禁言")
+
+            # 发送欢迎及群规引导消息（通过占位符替换支持随机题目与防重发随机码）
+            welcome_msg_template = config.get(
+                "welcome_message",
+                "欢迎加入本群！为了保证你能静下心看一眼群规，避免问出已有解决方法的问题，你已被自动禁言。请先查看群规并按照要求发送/执行动作，以取消禁言检测~"
+            )
+            formatted_welcome = format_template_message(
+                template=welcome_msg_template,
+                user_id=user_id,
+                question=verify_question,
+                count=1,
+                duration=initial_duration,
+                threshold=int(config.get("kick_threshold", 7)),
+                append_question_fallback=True
+            )
+
+            if formatted_welcome and formatted_welcome.strip():
+                await self._send_group_notice_message(event, group_id, user_id, formatted_welcome)
+                logger.info(f"[AutoBan] 已向群 {group_id} 的新成员 {user_id} 发送欢迎引导消息 (模式: {verify_mode})")
+
+        except Exception as e:
+            logger.error(f"[AutoBan] 处理新成员入群事件出错: {e}")
+
+    async def _handle_group_decrease(self, event: AstrMessageEvent, raw: dict):
+        """处理群成员退出或被移出事件"""
+        group_id = str(raw.get("group_id", "") or "").strip()
+        user_id = str(raw.get("user_id", "") or "").strip()
+        if not group_id or not user_id:
+            return
+
+        # 主动或被动退群后自动清理监控记录
+        removed = await self.db.remove_monitored_user(group_id, user_id)
+        if removed:
+            logger.info(f"[AutoBan] 用户 {user_id} 离开群 {group_id}，已从监控列表中移除")
+
+    async def _handle_poke(self, event: AstrMessageEvent, raw: dict):
+        """处理戳一戳事件（快速解禁）"""
+        group_id = str(raw.get("group_id", "") or "").strip()
+        user_id = str(raw.get("user_id", "") or "").strip()
+        target_id = str(raw.get("target_id", "") or "").strip()
+        self_id = str(event.get_self_id() or "").strip()
+
+        # 检查是否戳的是机器人自己
+        if target_id != self_id:
+            return
+
+        # 检查群是否启用功能
+        config = await self.db.get_group_config(group_id)
+        if not config or not config.get("enabled"):
+            return
+
+        # 检查是否开启戳一戳解禁
+        if not config.get("enable_poke_whitelist", 1):
+            return
+
+        # 检查用户是否在监控列表中
+        user_info = await self.db.get_monitored_user(group_id, user_id)
+        if not user_info:
+            return
+
+        try:
+            # 解除禁言
+            await self._unban_user(event, group_id, user_id)
+
+            # 移出监控列表
+            await self.db.remove_monitored_user(group_id, user_id)
+
+            # 发送解禁提示（解禁成功，不附带题目）
+            poke_template = config.get("poke_whitelist_message", "检测到戳一戳，已为您解除自动禁言监听~")
+            formatted_poke = format_template_message(
+                template=poke_template,
+                user_id=user_id,
+                question="",
+                count=int(user_info.get("ban_count", 1)),
+                duration=0,
+                threshold=int(config.get("kick_threshold", 7)),
+                append_question_fallback=False
+            )
+            if formatted_poke and formatted_poke.strip():
+                await self._send_group_notice_message(event, group_id, user_id, formatted_poke)
+
+            logger.info(f"[AutoBan] 用户 {user_id} 在群 {group_id} 通过戳一戳成功解除监听")
+            event.stop_event()
+
+        except Exception as e:
+            logger.error(f"[AutoBan] 处理戳一戳解除监听时出错: {e}")
+
+    async def _handle_monitored_user_message(self, event: AstrMessageEvent, raw: dict):
+        """处理受监控用户的群聊消息（仅对处于监听状态的成员生效）"""
+        group_id = str(event.get_group_id() or raw.get("group_id", "") or "").strip()
+        user_id = str(event.get_sender_id() or raw.get("user_id", "") or "").strip()
+
+        if not group_id or not user_id:
+            return
+
+        # 核心前置校验：查询该用户是否在数据库监控名单中
+        # 若不在监控名单，说明是正常群成员或已完成验证，绝不拦截、不撤回、不影响其发言
+        user_info = await self.db.get_monitored_user(group_id, user_id)
+        if not user_info:
+            return
+
+        # 检查本群是否开启了进群禁言总开关
+        config = await self.db.get_group_config(group_id)
+        if not config or not config.get("enabled"):
+            return
+
+        # 检查是否启用了后续消息监听
+        if not config.get("enable_follow_up_monitoring", 0):
+            return
+
+        # 获取消息纯文本
+        message_text = event.message_str or ""
+        if not message_text:
+            components = event.get_messages()
+            message_text = "".join(seg.text for seg in components if isinstance(seg, Comp.Plain))
+
+        # 读取当前群配置的验证模式与分配给该用户的题目
+        verify_mode = str(config.get("verify_mode", "keyword")).strip().lower()
+        expected_answer = str(user_info.get("verify_answer", "") or "").strip()
+        verify_question = str(user_info.get("verify_question", "") or "").strip()
+
+        # 兜底：若该监控用户此前未生成题目，在此补全生成
+        if not expected_answer and verify_mode != "keyword":
+            verify_question, expected_answer = generate_verification_challenge(config)
+            await self.db.add_monitored_user(
+                group_id=group_id,
+                user_id=user_id,
+                ban_count=user_info.get("ban_count", 1),
+                verify_question=verify_question,
+                verify_answer=verify_answer
+            )
+
+        # 校验用户消息是否满足解禁条件
+        is_passed = check_verification_answer(message_text, verify_mode, expected_answer, config)
+
+        if is_passed:
+            try:
+                # 验证通过：解禁并移除监控，放行此消息，绝不撤回
+                await self._unban_user(event, group_id, user_id)
+                await self.db.remove_monitored_user(group_id, user_id)
+
+                # 验证成功提示（不应再附带验证问题）
+                success_template = config.get("whitelist_success_message", "检测到您已阅读群规，已取消监控，欢迎正常发言~")
+                formatted_success = format_template_message(
+                    template=success_template,
+                    user_id=user_id,
+                    question="",
+                    count=int(user_info.get("ban_count", 1)),
+                    duration=0,
+                    threshold=int(config.get("kick_threshold", 7)),
+                    append_question_fallback=False
                 )
+                if formatted_success and formatted_success.strip():
+                    await self._send_group_notice_message(event, group_id, user_id, formatted_success)
 
-                # 更新禁言次数
-                self.banned_users[user_identifier] = new_total_count
-                self._save_banned_users()
-
-                # 发送对应的提示消息
-                message_index = min(current_total_count, len(self.ban_messages) - 1)
-                reminder_message = self.ban_messages[message_index]
-
-                response_chain = [
-                    Comp.At(qq=user_id),
-                    Comp.Plain(text=reminder_message),
-                ]
-                await event.send(event.chain_result(response_chain))
+                logger.info(f"[AutoBan] 监听中用户 {user_id} 在群 {group_id} 成功通过验证解除监听 (模式: {verify_mode})")
                 event.stop_event()
-
+                return
             except Exception as e:
-                logger.error(f"处理被禁言用户消息时执行禁言或踢出操作出错: {e}")
-        except Exception as e:
-            logger.error(f"handle_banned_user_message 方法出错: {e}")
+                logger.error(f"[AutoBan] 解除监听处理出错: {e}")
+                return
 
-    async def periodic_member_check(self):
-        """定期检查被监听的用户是否还在群内，以防错过退群事件"""
-        # 如果未启用后续监测，则不启动定期检查任务
-        if not self.enable_follow_up_monitoring:
-            return
+        # 未通过验证，属于监听中用户的违规发言
+        try:
+            # 1. 撤回开关：严格限制仅撤回当前处于监听中状态的用户所发送的违规消息
+            if bool(config.get("enable_recall_noncompliant_messages", 0)):
+                message_id = raw.get("message_id")
+                if message_id is None and hasattr(event, "message_obj"):
+                    message_id = getattr(event.message_obj, "message_id", None)
 
-        await asyncio.sleep(60)  # 启动后稍作等待，避免与其他启动任务冲突
-        while True:
-            try:
-                # 获取 aiocqhttp 平台实例
-                client = next(
-                    (
-                        c
-                        for p in self.context.platform_manager.get_insts()
-                        if p.meta().name == "aiocqhttp" and (c := p.get_client())
-                    ),
-                    None,
-                )
-
-                if not client:
-                    logger.warning(
-                        "未能获取到 aiocqhttp 平台实例，成员检查将在1小时后重试。"
-                    )
-                    await asyncio.sleep(3600)
-                    continue
-                # 按群组ID对被监听用户进行分组，以减少API调用次数
-                groups_to_check = {}
-                # 创建banned_users的副本进行迭代，防止在迭代过程中修改字典
-                for group_id, user_id in list(self.banned_users.keys()):
-                    if group_id not in groups_to_check:
-                        groups_to_check[group_id] = set()
-                    groups_to_check[group_id].add(user_id)
-
-                if groups_to_check:
-                    logger.debug(
-                        f"开始定期成员检查，涉及 {len(groups_to_check)} 个群聊。"
-                    )
-
-                for group_id, users_in_group_to_check in groups_to_check.items():
+                # 校验发送者与监听中用户一致
+                sender_id = str(raw.get("user_id") or event.get_sender_id() or "").strip()
+                if message_id is not None and sender_id == user_id:
                     try:
-                        # 获取群成员列表
-                        members_info = await client.call_action(
-                            "get_group_member_list",
-                            group_id=int(group_id),
-                            no_cache=True,
+                        await self._delete_msg(event, int(message_id))
+                        logger.info(
+                            f"[AutoBan] 已撤回监听中用户 {user_id} 在群 {group_id} 的未合规发言 (消息ID: {message_id})"
                         )
-                        current_member_ids = {
-                            member["user_id"] for member in members_info
-                        }
-
-                        # 找出已经不在群里的用户
-                        users_left = users_in_group_to_check - current_member_ids
-
-                        for user_id in users_left:
-                            user_identifier = (group_id, user_id)
-                            self.remove_user_from_watchlist(
-                                user_identifier, "定期检查发现用户已不在群内"
-                            )
-
-                        # 避免API调用过于频繁
-                        await asyncio.sleep(5)
-
                     except Exception as e:
-                        logger.error(f"定期检查群 {group_id} 成员时出错: {e}")
+                        logger.warning(
+                            f"[AutoBan] 撤回监听中用户 {user_id} 的违规消息失败 (可能机器人无管理权限或消息已撤回): {e}"
+                        )
 
-            except Exception as e:
-                logger.error(f"periodic_member_check 任务发生未知错误: {e}")
+            # 2. 计次开关：若开启则统计违规次数并检查自动踢出阈值，关闭时不累加也不触发踢出
+            current_count = int(user_info.get("ban_count", 1))
+            if bool(config.get("enable_violation_count", 1)):
+                new_count = current_count + 1
+                await self.db.update_ban_count(group_id, user_id, new_count)
+                kick_threshold = int(config.get("kick_threshold", 7))
 
-            # 每小时检查一次
-            await asyncio.sleep(3600)
+                if new_count >= kick_threshold:
+                    kick_template = config.get(
+                        "kick_message",
+                        '由于多次未按要求完成验证，你已被标记为恶意用户并移出群聊。'
+                    )
+                    formatted_kick = format_template_message(
+                        template=kick_template,
+                        user_id=user_id,
+                        question=verify_question,
+                        count=new_count,
+                        duration=0,
+                        threshold=kick_threshold,
+                        append_question_fallback=False
+                    )
+                    if formatted_kick and formatted_kick.strip():
+                        await self._send_group_notice_message(event, group_id, user_id, formatted_kick)
 
-    @filter.command("添加启用群聊")
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    async def add_target_group(
-        self, event: AiocqhttpMessageEvent, group_id: str
-    ) -> AsyncGenerator[MessageEventResult, None]:
-        """添加启用群聊"""
-        # 验证群号格式（必须为纯数字）
-        if not group_id.isdigit():
-            yield event.plain_result("群号必须为纯数字")
-            return
+                    await self._kick_user(event, group_id, user_id)
+                    await self.db.remove_monitored_user(group_id, user_id)
+                    logger.info(f"[AutoBan] 用户 {user_id} 在群 {group_id} 违规达 {kick_threshold} 次，已执行踢出")
+                    event.stop_event()
+                    return
+            else:
+                new_count = current_count
 
-        # 检查是否已经在列表中
-        if group_id in self.target_groups:
-            yield event.plain_result(f"群 {group_id} 已在启用列表中")
-            return
+            # 3. 后续禁言开关：若开启则执行递进禁言，关闭时跳过禁言操作
+            if bool(config.get("enable_follow_up_ban", 1)):
+                duration = self._get_ban_duration(config, new_count)
+                await self._ban_user(event, group_id, user_id, duration)
+                logger.info(f"[AutoBan] 用户 {user_id} 在群 {group_id} 第 {new_count} 次违规，执行禁言 {duration} 秒")
+            else:
+                duration = 0
+                logger.info(f"[AutoBan] 群 {group_id} 后续禁言开关已关闭，跳过禁言处罚")
 
-        # 添加到配置
-        self.target_groups.add(group_id)
-        target_groups_list = list(self.target_groups)
-        self.config["target_groups"] = target_groups_list
-        self.config.save_config()
+            # 4. 发送对应阶段违规提示（使用占位符替换，并在重复发送时提醒随机题目与防重发随机码）
+            raw_ban_msg = self._get_ban_message(config, new_count)
+            formatted_ban_msg = format_template_message(
+                template=raw_ban_msg,
+                user_id=user_id,
+                question=verify_question,
+                count=new_count,
+                duration=duration,
+                threshold=int(config.get("kick_threshold", 7)),
+                append_question_fallback=True
+            )
 
-        yield event.plain_result(f"已添加群 {group_id} 到启用列表")
+            if formatted_ban_msg and formatted_ban_msg.strip():
+                await self._send_group_notice_message(event, group_id, user_id, formatted_ban_msg)
 
-    # 命令功能
-    @filter.command_group("自动禁言")
-    def auto_ban_commands(self):
-        """自动禁言插件命令组"""
-        pass
+            logger.info(f"[AutoBan] 用户 {user_id} 在群 {group_id} 第 {new_count} 次违规，执行禁言 {duration} 秒")
+            event.stop_event()
 
-    @auto_ban_commands.command("off")
-    @perm_required(PermLevel.ADMIN)
-    async def disable_monitoring(
-        self, event: AiocqhttpMessageEvent
-    ) -> AsyncGenerator[MessageEventResult, None]:
-        """关闭后续禁言监测功能"""
-        self.enable_follow_up_monitoring = False
-        self.config["enable_follow_up_monitoring"] = False
-        self.config.save_config()
-        yield event.plain_result(
-            "已关闭后续发言监测功能，新成员入群仍会被禁言，但不会进行后续监听"
-        )
+        except Exception as e:
+            logger.error(f"[AutoBan] 处理监控用户违规发言出错: {e}")
 
-    @auto_ban_commands.command("on")
-    @perm_required(PermLevel.ADMIN)
-    async def enable_monitoring(
-        self, event: AiocqhttpMessageEvent
-    ) -> AsyncGenerator[MessageEventResult, None]:
-        """开启后续禁言监测功能"""
-        self.enable_follow_up_monitoring = True
-        self.config["enable_follow_up_monitoring"] = True
-        self.config.save_config()
+    # ==================== 后台定期巡检 ====================
 
-        # 启动后台检查任务（如果尚未启动）
-        if not self._periodic_task_started:
-            asyncio.create_task(self.periodic_member_check())
-            self._periodic_task_started = True
-
-        yield event.plain_result("已开启后续发言监测功能，新成员入群后将被持续监听")
-
-    @auto_ban_commands.command("撤回")
-    @perm_required(PermLevel.ADMIN)
-    async def set_recall_noncompliant_messages(
-        self, event: AiocqhttpMessageEvent, switch: str
-    ) -> AsyncGenerator[MessageEventResult, None]:
-        """设置是否撤回被监听用户未按要求发送的消息"""
-        enabled = parse_switch_value(switch)
-        if enabled is None:
-            yield event.plain_result("参数应为 on/off、开启/关闭 或 true/false")
-            return
-
-        self.enable_recall_noncompliant_messages = enabled
-        self.config["enable_recall_noncompliant_messages"] = enabled
-        self.config.save_config()
-
-        status = "开启" if enabled else "关闭"
-        yield event.plain_result(f"已{status}未按要求发言自动撤回功能")
-
-    @auto_ban_commands.command("名单")
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    async def show_ban_list(
-        self, event: AiocqhttpMessageEvent
-    ) -> AsyncGenerator[MessageEventResult, None]:
-        """查看当前被监听的用户名单（仅超级管理员）"""
-        if not self.banned_users:
-            yield event.plain_result("当前没有被监听的用户")
-            return
-
-        # 构建表格
-        lines = ["===当前禁言监听名单===", "群号        | 昵称           | QQ号"]
-        lines.append("-" * 45)
-
-        for (group_id, user_id), ban_count in self.banned_users.items():
-            # 尝试获取用户昵称
-            nickname = str(user_id)
+    async def _periodic_member_check(self):
+        """定期检查被监控成员是否仍在群内，自动清理已离开的用户"""
+        await asyncio.sleep(60)
+        while self._is_running:
             try:
-                member_info = await event.bot.get_group_member_info(
-                    group_id=int(group_id), user_id=int(user_id), no_cache=False
-                )
-                nickname = (
-                    member_info.get("nickname")
-                    or member_info.get("card")
-                    or str(user_id)
-                )
-                # 截断过长的昵称
-                if len(nickname) > 10:
-                    nickname = nickname[:9] + "…"
-            except Exception:
-                nickname = "(未知)"
+                all_users = await self.db.get_all_monitored_users()
+                if all_users:
+                    client = await self._get_any_client()
+                    if client:
+                        to_remove = []
+                        for group_id, user_id, _ in all_users:
+                            try:
+                                result = await client.call_action(
+                                    "get_group_member_info",
+                                    group_id=int(group_id),
+                                    user_id=int(user_id),
+                                    no_cache=True
+                                )
+                                if not result:
+                                    to_remove.append((group_id, user_id))
+                            except Exception:
+                                to_remove.append((group_id, user_id))
 
-            # 格式化输出行
-            lines.append(
-                f"{group_id:<11} | {nickname:<14} | {user_id} (禁言{ban_count}次)"
-            )
+                        if to_remove:
+                            count = await self.db.batch_remove_users(to_remove)
+                            logger.info(f"[AutoBan] 定期巡检清理了 {count} 名已离开群聊的被监控用户")
 
-        lines.append("-" * 45)
-        lines.append(f"共 {len(self.banned_users)} 人")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"[AutoBan] 定期巡检任务出错: {e}")
 
-        yield event.plain_result("\n".join(lines))
+            # 每 10 分钟检查一次
+            await asyncio.sleep(600)
 
-    @filter.command("设置解禁关键词")
-    @perm_required(PermLevel.ADMIN)
-    async def set_whitelist_keywords(
-        self, event: AiocqhttpMessageEvent, keywords: str
-    ) -> AsyncGenerator[MessageEventResult, None]:
-        """设置解除监听的关键词"""
-        # 解析关键词（用空格分隔）
-        keyword_list = [kw.strip() for kw in keywords.split() if kw.strip()]
-        if not keyword_list:
-            yield event.plain_result("请提供至少一个关键词，用空格分隔")
-            return
+    # ==================== OneBot API 封装 ====================
 
-        self.whitelist_keywords = keyword_list
-        self.config["whitelist_keywords"] = keyword_list
-        self.config.save_config()
+    async def _send_group_notice_message(self, event: AstrMessageEvent, group_id: str, user_id: str, formatted_text: str):
+        """发送群提示消息，确保包含 @新成员，并具备 OneBot send_group_msg 兜底发信"""
+        uid = int(user_id) if user_id.isdigit() else user_id
+        has_cq_at = f"[CQ:at,qq={user_id}]" in formatted_text
 
-        keywords_str = "、".join(keyword_list)
-        yield event.plain_result(f"已设置解禁关键词：{keywords_str}")
-
-    @filter.command("设置禁言踢出次数")
-    @perm_required(PermLevel.ADMIN)
-    async def set_kick_threshold(
-        self, event: AiocqhttpMessageEvent, threshold: int
-    ) -> AsyncGenerator[MessageEventResult, None]:
-        """设置踢出阈值"""
-        # 验证阈值范围
-        if threshold < 2:
-            yield event.plain_result("踢出阈值不能小于2次")
-            return
-        if threshold > 50:
-            yield event.plain_result("踢出阈值不能大于50次")
-            return
-
-        self.kick_threshold = threshold
-        self.config["kick_threshold"] = threshold
-        self.config.save_config()
-        yield event.plain_result(f"已设置踢出阈值为：{threshold} 次")
-
-    @filter.command("设置解禁提示消息")
-    @perm_required(PermLevel.ADMIN)
-    async def set_whitelist_success_message(
-        self, event: AiocqhttpMessageEvent, message: str
-    ) -> AsyncGenerator[MessageEventResult, None]:
-        """设置解禁提示消息"""
-        self.whitelist_success_message = message
-        self.config["whitelist_success_message"] = message
-        self.config.save_config()
-        if message.strip():
-            yield event.plain_result(f"已设置解禁提示消息：\n{message}")
+        # 构建 AstrBot 消息链（若文本中未显式插入 [CQ:at]，则在消息开头自动加上 Comp.At 组件）
+        if has_cq_at:
+            chain = [Comp.Plain(formatted_text)]
         else:
-            yield event.plain_result(
-                "已设置解禁提示消息为空，触发关键词解禁时将不再发送提示文本"
-            )
+            chain = [Comp.At(qq=uid), Comp.Plain(f" {formatted_text}")]
 
-    @filter.command("设置禁言时长")
-    @perm_required(PermLevel.ADMIN)
-    async def set_ban_durations(
-        self, event: AiocqhttpMessageEvent, durations_str: str
-    ) -> AsyncGenerator[MessageEventResult, None]:
-        """设置禁言时长"""
+        sent = False
         try:
-            # 解析参数，格式：1/300 2/600 3/1800 4/3600
-            duration_pairs = durations_str.strip().split()
-            new_durations = [180, 180, 600, 3600]  # 默认值
-
-            for pair in duration_pairs:
-                if "/" not in pair:
-                    yield event.plain_result(f"格式错误：{pair}，应为 次数/时长 格式")
-                    return
-
-                try:
-                    count_str, duration_str = pair.split("/", 1)
-                    count = int(count_str)
-                    duration = int(duration_str)
-
-                    # 验证参数
-                    if count < 1 or count > 4:
-                        yield event.plain_result(
-                            f"禁言次数应在1-4之间，但收到：{count}"
-                        )
-                        return
-                    if duration < 10 or duration > 86400:  # 10秒到24小时
-                        yield event.plain_result(
-                            f"禁言时长应在10-86400秒之间，但收到：{duration}"
-                        )
-                        return
-
-                    # 设置时长（索引从0开始）
-                    new_durations[count - 1] = duration
-
-                except ValueError:
-                    yield event.plain_result(f"格式错误：{pair}，次数和时长必须为整数")
-                    return
-
-            # 更新配置
-            self.ban_durations = new_durations
-            ban_durations_config = {
-                "first_ban": new_durations[0],
-                "second_ban": new_durations[1],
-                "third_ban": new_durations[2],
-                "fourth_and_more_ban": new_durations[3],
-            }
-            self.config["ban_durations"] = ban_durations_config
-            self.config.save_config()
-
-            duration_info = f"第1次：{new_durations[0]}秒，第2次：{new_durations[1]}秒，第3次：{new_durations[2]}秒，第4次及以后：{new_durations[3]}秒"
-            yield event.plain_result(f"已设置禁言时长：\n{duration_info}")
-
+            await event.send(event.chain_result(chain))
+            sent = True
         except Exception as e:
-            logger.error(f"设置禁言时长时出错: {e}")
-            yield event.plain_result(
-                "设置失败，请检查参数格式。示例：1/10 2/100 3/1000 4/10000"
+            logger.warning(f"[AutoBan] event.send 投递失败 (常见于 Notice 事件)，尝试使用 OneBot 原生 API 发信: {e}")
+
+        # 若 event.send 投递失败（OneBot Notice 事件无会话上下文），通过 send_group_msg 兜底直发群聊
+        if not sent:
+            try:
+                bot = getattr(event, "bot", None)
+                msg_str = formatted_text if has_cq_at else f"[CQ:at,qq={user_id}] {formatted_text}"
+                if bot and hasattr(bot, "call_action"):
+                    await bot.call_action("send_group_msg", group_id=int(group_id), message=msg_str)
+                elif bot and hasattr(bot, "api") and hasattr(bot.api, "call_action"):
+                    await bot.api.call_action("send_group_msg", group_id=int(group_id), message=msg_str)
+                else:
+                    client = await self._get_any_client()
+                    if client:
+                        await client.call_action("send_group_msg", group_id=int(group_id), message=msg_str)
+            except Exception as e:
+                logger.error(f"[AutoBan] 兜底发送群消息失败: {e}")
+
+    async def _ban_user(self, event: AstrMessageEvent, group_id: str, user_id: str, duration: int):
+        """禁言用户"""
+        bot = getattr(event, "bot", None)
+        if bot and hasattr(bot, "set_group_ban"):
+            await bot.set_group_ban(
+                group_id=int(group_id),
+                user_id=int(user_id),
+                duration=int(duration)
             )
-
-    @filter.command("设置入群提醒")
-    @perm_required(PermLevel.ADMIN)
-    async def set_welcome_message(
-        self, event: AiocqhttpMessageEvent, message: str
-    ) -> AsyncGenerator[MessageEventResult, None]:
-        """设置新成员入群欢迎消息"""
-        if not message.strip():
-            yield event.plain_result("欢迎消息不能为空")
-            return
-
-        self.welcome_message = message
-        self.config["welcome_message"] = message
-        self.config.save_config()
-        yield event.plain_result(f"已设置入群提醒：\n{message}")
-
-    @filter.command("设置禁言提示消息")
-    @perm_required(PermLevel.ADMIN)
-    async def set_ban_message(
-        self, event: AiocqhttpMessageEvent, config_str: str
-    ) -> AsyncGenerator[MessageEventResult, None]:
-        """设置禁言提示消息"""
-        try:
-            # 解析参数，格式：次数/消息内容
-            if "/" not in config_str:
-                yield event.plain_result("格式错误，应为：次数/消息内容")
-                return
-
-            count_str, message = config_str.split("/", 1)
-            count = int(count_str)
-
-            # 验证次数范围
-            if count < 1 or count > 4:
-                yield event.plain_result("禁言次数应在1-4之间")
-                return
-
-            if not message.strip():
-                yield event.plain_result("提示消息不能为空")
-                return
-
-            # 更新对应的提示消息
-            ban_messages_config = self.config.get("ban_messages", {})
-            message_keys = [
-                "first_message",
-                "second_message",
-                "third_message",
-                "fourth_and_more_message",
-            ]
-
-            ban_messages_config[message_keys[count - 1]] = message
-            self.config["ban_messages"] = ban_messages_config
-
-            # 更新内存中的配置
-            self.ban_messages[count - 1] = message
-
-            self.config.save_config()
-            yield event.plain_result(f"已设置第{count}次禁言提示消息：\n{message}")
-
-        except ValueError:
-            yield event.plain_result("次数必须为整数，格式：次数/消息内容")
-        except Exception as e:
-            logger.error(f"设置禁言提示消息时出错: {e}")
-            yield event.plain_result("设置失败，请检查参数格式")
-
-    @filter.command("设置戳一戳提示消息")
-    @perm_required(PermLevel.ADMIN)
-    async def set_poke_message(
-        self, event: AiocqhttpMessageEvent, message: str
-    ) -> AsyncGenerator[MessageEventResult, None]:
-        """设置戳一戳解除监听提示消息"""
-        self.poke_whitelist_message = message
-        self.config["poke_whitelist_message"] = message
-        self.config.save_config()
-
-        if message.strip():
-            yield event.plain_result(f"已设置戳一戳解除监听提示消息：\n{message}")
         else:
-            yield event.plain_result("已设置戳一戳解除监听提示消息为空（不发送提示）")
+            client = await self._get_any_client()
+            if client:
+                await client.call_action(
+                    "set_group_ban",
+                    group_id=int(group_id),
+                    user_id=int(user_id),
+                    duration=int(duration)
+                )
 
-    @filter.command("设置踢出提示消息")
-    @perm_required(PermLevel.ADMIN)
-    async def set_kick_message(
-        self, event: AiocqhttpMessageEvent, message: str
-    ) -> AsyncGenerator[MessageEventResult, None]:
-        """设置踢出提示消息"""
-        if not message.strip():
-            yield event.plain_result("踢出提示消息不能为空")
-            return
+    async def _unban_user(self, event: AstrMessageEvent, group_id: str, user_id: str):
+        """解除用户禁言"""
+        await self._ban_user(event, group_id, user_id, 0)
 
-        self.kick_message = message
-        self.config["kick_message"] = message
-        self.config.save_config()
-        yield event.plain_result(f"已设置踢出提示消息：\n{message}")
+    async def _delete_msg(self, event: AstrMessageEvent, message_id: int):
+        """撤回消息"""
+        bot = getattr(event, "bot", None)
+        if bot and hasattr(bot, "delete_msg"):
+            await bot.delete_msg(message_id=int(message_id))
+        else:
+            client = await self._get_any_client()
+            if client:
+                await client.call_action("delete_msg", message_id=int(message_id))
 
-    @filter.command("进群禁言帮助", alias={"自动禁言帮助"})
-    async def show_help(
-        self, event: AiocqhttpMessageEvent
-    ) -> AsyncGenerator[MessageEventResult, None]:
-        """显示插件帮助信息"""
-        help_text = """===AstrBot 自动禁言插件===
-v1.5 by 糯米茨(3218444911)
-插件简介：
-在指定群聊中对新入群用户自动禁言并发送欢迎消息，支持多种方式解除监听。帮助群管理员更好地管理新成员，确保新成员先阅读群规再发言。
-可用命令（仅群管理员&BOT管理员）：
-⚙️ 功能设置
-- /自动禁言 off/on - 关闭/开启后续禁言监测
-- /自动禁言 撤回 on/off - 设置是否撤回未按要求的发言
-- /设置解禁关键词 <关键词> - 设置解除监听关键词
-- /设置禁言踢出次数 <次数> - 设置踢出阈值
-- /设置禁言时长 <配置> - 设置各次禁言时长
+    async def _kick_user(self, event: AstrMessageEvent, group_id: str, user_id: str):
+        """踢出群成员"""
+        bot = getattr(event, "bot", None)
+        if bot and hasattr(bot, "set_group_kick"):
+            await bot.set_group_kick(
+                group_id=int(group_id),
+                user_id=int(user_id),
+                reject_add_request=False
+            )
+        else:
+            client = await self._get_any_client()
+            if client:
+                await client.call_action(
+                    "set_group_kick",
+                    group_id=int(group_id),
+                    user_id=int(user_id),
+                    reject_add_request=False
+                )
 
-✅ 信息提示
-- /设置入群提醒 <消息内容> - 设置入群提示消息
-- /设置禁言提示消息 <次数/消息> - 设置禁言提示消息
-- /设置戳一戳提示消息 <消息内容> - 设置戳一戳解除提示
-- /设置解禁提示消息 <消息内容> - 设置关键词解除后的提示文本
-- /设置踢出提示消息 <消息内容> - 设置踢出提示消息
-- /进群禁言帮助 - 显示此帮助信息
+    async def _get_any_client(self):
+        """获取可用的 OneBot 客户端实例"""
+        try:
+            platform = self.context.get_platform(filter.PlatformAdapterType.AIOCQHTTP)
+            if platform and hasattr(platform, "get_client"):
+                return platform.get_client()
+        except Exception:
+            pass
 
-🛠️ 超级管理员专用
-- /添加启用群聊 <群号> - 添加启用群聊
-- /自动禁言 名单 - 查看当前被监听的用户名单
+        try:
+            for inst in self.context.platform_manager.get_insts():
+                if getattr(inst, "meta", lambda: None)().name == "aiocqhttp":
+                    if hasattr(inst, "get_client"):
+                        return inst.get_client()
+                    if hasattr(inst, "client"):
+                        return inst.client
+        except Exception:
+            pass
+        return None
 
-示例用法：
-- /设置解禁关键词 我已阅读群规 同意遵守
-- /设置禁言踢出次数 5
-- /设置禁言时长 1/60 2/300 3/1800 4/7200
-- /自动禁言 撤回 on
-- /添加启用群聊 123456789
-- /设置入群提醒 欢迎新成员！请先阅读群规
-- /设置禁言提示消息 2/请仔细阅读群规后再发言
-- /设置戳一戳提示消息 已为您解除监听
-- /设置踢出提示消息 多次违规，现在移除群聊
-解除监听方式：
-1. 发送包含解禁关键词的消息
-2. 戳一戳机器人（需开启此功能）
-3. 主动退群或被踢出群聊
+    def _get_ban_duration(self, config: Dict[str, Any], ban_count: int) -> int:
+        """根据违规次数获取禁言时长"""
+        if ban_count <= 2:
+            return int(config.get("ban_duration_1", 180))
+        elif ban_count == 3:
+            return int(config.get("ban_duration_2", 180))
+        elif ban_count == 4:
+            return int(config.get("ban_duration_3", 600))
+        else:
+            return int(config.get("ban_duration_4", 3600))
 
-⚠注意！提示消息无法识别空格和换行，请使用标点符号分隔！"""
-
-        yield event.plain_result(help_text)
+    def _get_ban_message(self, config: Dict[str, Any], ban_count: int) -> str:
+        """根据违规次数获取提示消息"""
+        if ban_count <= 2:
+            return config.get("ban_message_1", "第1次提醒：仍请先阅读群规，请先查看群规并按照要求发送/执行动作，以取消禁言检测~")
+        elif ban_count == 3:
+            return config.get("ban_message_2", "第2次提醒：多次未查看群规，禁言时间延长，请认真查看群规并按照要求发送/执行动作，以取消禁言检测~")
+        elif ban_count == 4:
+            return config.get("ban_message_3", "第3次提醒：请认真阅读群规后再发言，避免影响其他群员。")
+        else:
+            return config.get("ban_message_4", "还是不想查看吗？禁言时间已固定为最大时长，直至阅读群规并按照要求发送/执行动作，以取消禁言检测~")
